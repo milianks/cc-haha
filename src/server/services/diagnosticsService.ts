@@ -27,6 +27,7 @@ export type DiagnosticEvent = {
 export type DiagnosticsStatus = {
   logDir: string
   diagnosticsPath: string
+  cliDiagnosticsPath: string
   runtimeErrorsPath: string
   exportDir: string
   retentionDays: number
@@ -46,6 +47,7 @@ export type DiagnosticsExportResult = {
 const RETENTION_DAYS = 7
 const MAX_BYTES = 50 * 1024 * 1024
 const MAX_STRING_LENGTH = 4096
+const MAX_TEXT_FILE_EXPORT_LENGTH = 256 * 1024
 const MAX_ARRAY_ITEMS = 40
 const MAX_OBJECT_KEYS = 80
 const MAX_EVENTS_IN_EXPORT = 5000
@@ -53,6 +55,7 @@ const SENSITIVE_KEY_RE = /(api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_
 
 export class DiagnosticsService {
   private consoleCaptureInstalled = false
+  private processCaptureInstalled = false
   private originalConsoleError: typeof console.error | null = null
   private originalConsoleWarn: typeof console.warn | null = null
 
@@ -62,6 +65,10 @@ export class DiagnosticsService {
 
   getDiagnosticsPath(): string {
     return path.join(this.getLogDir(), 'diagnostics.jsonl')
+  }
+
+  getCliDiagnosticsPath(): string {
+    return path.join(this.getLogDir(), 'cli-diagnostics.jsonl')
   }
 
   getRuntimeErrorsPath(): string {
@@ -87,7 +94,7 @@ export class DiagnosticsService {
       await this.ensureLogDir()
       await fs.appendFile(this.getDiagnosticsPath(), JSON.stringify(event) + '\n', 'utf-8')
       if (event.severity === 'warn' || event.severity === 'error') {
-        await fs.appendFile(this.getRuntimeErrorsPath(), this.formatRuntimeLogLine(event), 'utf-8')
+        await fs.appendFile(this.getRuntimeErrorsPath(), this.formatRuntimeLogEntry(event), 'utf-8')
       }
       await this.enforceRetention().catch(() => {})
     } catch {
@@ -128,6 +135,29 @@ export class DiagnosticsService {
     this.originalConsoleWarn = null
   }
 
+  installProcessCapture(): void {
+    if (this.processCaptureInstalled) return
+    this.processCaptureInstalled = true
+
+    process.on('uncaughtException', (error) => {
+      void this.recordEvent({
+        type: 'server_uncaught_exception',
+        severity: 'error',
+        summary: error.message || 'Uncaught exception',
+        details: { error },
+      })
+    })
+
+    process.on('unhandledRejection', (reason) => {
+      void this.recordEvent({
+        type: 'server_unhandled_rejection',
+        severity: 'error',
+        summary: this.formatUnknownReason(reason),
+        details: { reason },
+      })
+    })
+  }
+
   async getStatus(): Promise<DiagnosticsStatus> {
     await this.ensureLogDir()
     const events = await this.readRecentEvents(500)
@@ -136,6 +166,7 @@ export class DiagnosticsService {
     return {
       logDir: this.getLogDir(),
       diagnosticsPath: this.getDiagnosticsPath(),
+      cliDiagnosticsPath: this.getCliDiagnosticsPath(),
       runtimeErrorsPath: this.getRuntimeErrorsPath(),
       exportDir: this.getExportDir(),
       retentionDays: RETENTION_DAYS,
@@ -195,8 +226,16 @@ export class DiagnosticsService {
         content: events.map((event) => JSON.stringify(this.sanitizeValue(event))).join('\n') + (events.length ? '\n' : ''),
       },
       {
+        name: 'recent-errors.md',
+        content: this.buildRecentErrorsSummary(events),
+      },
+      {
         name: 'runtime-errors.log',
-        content: await this.readSanitizedTextFile(this.getRuntimeErrorsPath()),
+        content: await this.readSanitizedTextFile(this.getRuntimeErrorsPath(), MAX_TEXT_FILE_EXPORT_LENGTH),
+      },
+      {
+        name: 'cli-diagnostics.jsonl',
+        content: await this.readSanitizedTextFile(this.getCliDiagnosticsPath(), MAX_TEXT_FILE_EXPORT_LENGTH),
       },
       {
         name: 'providers-summary.json',
@@ -305,8 +344,26 @@ export class DiagnosticsService {
     }).join(' '))
   }
 
-  private formatRuntimeLogLine(event: DiagnosticEvent): string {
-    return `[${event.timestamp}] ${event.severity.toUpperCase()} ${event.type}${event.sessionId ? ` session=${event.sessionId}` : ''}: ${event.summary}\n`
+  private formatUnknownReason(reason: unknown): string {
+    if (reason instanceof Error) return reason.message || reason.name
+    if (typeof reason === 'string') return this.sanitizeString(reason)
+    try {
+      return this.sanitizeString(JSON.stringify(this.sanitizeValue(reason)))
+    } catch {
+      return this.sanitizeString(String(reason))
+    }
+  }
+
+  private formatRuntimeLogEntry(event: DiagnosticEvent): string {
+    const lines = [
+      `[${event.timestamp}] ${event.severity.toUpperCase()} ${event.type}${event.sessionId ? ` session=${event.sessionId}` : ''}`,
+      `summary: ${event.summary}`,
+    ]
+    if (event.details !== undefined) {
+      lines.push('details:')
+      lines.push(JSON.stringify(event.details, null, 2))
+    }
+    return `${lines.join('\n')}\n\n`
   }
 
   private buildReadme(): string {
@@ -320,11 +377,49 @@ export class DiagnosticsService {
       'Files:',
       '- app-info.json: runtime and platform summary.',
       '- diagnostics.jsonl: sanitized structured diagnostic events.',
-      '- runtime-errors.log: sanitized warning/error summaries.',
+      '- recent-errors.md: human-readable warning/error timeline for GitHub issues.',
+      '- runtime-errors.log: sanitized warning/error timeline with captured runtime details.',
+      '- cli-diagnostics.jsonl: sanitized no-PII CLI internal diagnostics emitted by the child process.',
       '- providers-summary.json: provider count, active id, base URL host, model ids, and API format without API keys.',
       '- sessions-summary.json: session ids observed in diagnostic events, without transcript content.',
       '',
     ].join('\n')
+  }
+
+  private buildRecentErrorsSummary(events: DiagnosticEvent[]): string {
+    const errorEvents = events
+      .filter((event) => event.severity === 'error' || event.severity === 'warn')
+      .slice(0, 50)
+
+    const lines = [
+      '# yuanclaw recent diagnostics',
+      '',
+      `Generated: ${new Date().toISOString()}`,
+      `Events included: ${errorEvents.length}`,
+      '',
+    ]
+
+    if (errorEvents.length === 0) {
+      lines.push('No recent warnings or errors were recorded.')
+      lines.push('')
+      return lines.join('\n')
+    }
+
+    for (const event of errorEvents) {
+      lines.push(`## ${event.timestamp} ${event.severity.toUpperCase()} ${event.type}`)
+      if (event.sessionId) lines.push(`session: ${event.sessionId}`)
+      lines.push('')
+      lines.push(event.summary)
+      if (event.details !== undefined) {
+        lines.push('')
+        lines.push('```json')
+        lines.push(JSON.stringify(event.details, null, 2))
+        lines.push('```')
+      }
+      lines.push('')
+    }
+
+    return lines.join('\n')
   }
 
   private buildAppInfo(): Record<string, unknown> {
@@ -404,9 +499,12 @@ export class DiagnosticsService {
     }
   }
 
-  private async readSanitizedTextFile(filePath: string): Promise<string> {
+  private async readSanitizedTextFile(
+    filePath: string,
+    maxLength = 2 * MAX_STRING_LENGTH,
+  ): Promise<string> {
     try {
-      return this.sanitizeString(await fs.readFile(filePath, 'utf-8'), 2 * MAX_STRING_LENGTH)
+      return this.sanitizeString(await fs.readFile(filePath, 'utf-8'), maxLength)
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return ''
       throw err

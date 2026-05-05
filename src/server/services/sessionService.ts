@@ -12,6 +12,7 @@ import { sanitizePath as sanitizePortablePath } from '../../utils/sessionStorage
 import type { FileHistorySnapshot } from '../../utils/fileHistory.js'
 import { calculateUSDCost, MODEL_COSTS } from '../../utils/modelCost.js'
 import {
+  calculateCurrentContextTokenTotal,
   MODEL_CONTEXT_WINDOW_DEFAULT,
   getContextWindowForModel,
   getModelMaxOutputTokens,
@@ -890,12 +891,19 @@ export class SessionService {
     if (!latest) return null
 
     const rawMaxTokens = this.getTranscriptContextWindow(latest.model)
-    const totalTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
+    const promptTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
+    const totalTokens = calculateCurrentContextTokenTotal(promptTokens, {
+      input_tokens: latest.inputTokens,
+      output_tokens: latest.outputTokens,
+      cache_read_input_tokens: latest.cacheReadInputTokens,
+      cache_creation_input_tokens: latest.cacheCreationInputTokens,
+    })
     const percentage = rawMaxTokens > 0 ? Math.round((totalTokens / rawMaxTokens) * 100) : 0
     const categories: TranscriptContextEstimate['categories'] = [
       { name: 'Input tokens', tokens: latest.inputTokens, color: '#8f3217' },
       { name: 'Cache read', tokens: latest.cacheReadInputTokens, color: '#0f5c8f' },
       { name: 'Cache write', tokens: latest.cacheCreationInputTokens, color: '#7c3aed' },
+      { name: 'Output tokens', tokens: latest.outputTokens, color: '#2f7d32' },
       { name: 'Free space', tokens: Math.max(0, rawMaxTokens - totalTokens), color: '#a1a1aa', isDeferred: true },
     ].filter((category) => category.tokens > 0)
 
@@ -1196,18 +1204,20 @@ export class SessionService {
     // expand relative paths — in bundled sidecar mode the server's cwd is
     // typically '/'. Callers (IM adapters) already send absolute realPath,
     // but we log here so cwd regressions are caught early.
-    const absWorkDir = path.resolve(resolvedWorkDir)
+    const resolvedPath = path.resolve(resolvedWorkDir)
+    let absWorkDir: string
+    try {
+      absWorkDir = await fs.realpath(resolvedPath)
+    } catch {
+      throw ApiError.badRequest(`Working directory does not exist: ${resolvedPath}`)
+    }
     console.log(
       `[SessionService] createSession: requested workDir=${JSON.stringify(
         workDir,
       )}, resolved=${absWorkDir} (process.cwd()=${process.cwd()})`,
     )
     let stat
-    try {
-      stat = await fs.stat(absWorkDir)
-    } catch {
-      throw ApiError.badRequest(`Working directory does not exist: ${absWorkDir}`)
-    }
+    stat = await fs.stat(absWorkDir)
     if (!stat.isDirectory()) {
       throw ApiError.badRequest(`Working directory is not a directory: ${absWorkDir}`)
     }
@@ -1377,7 +1387,8 @@ export class SessionService {
   async clearSessionTranscript(sessionId: string, fallbackWorkDir?: string): Promise<void> {
     let found = await this.findSessionFile(sessionId)
     if (!found && fallbackWorkDir) {
-      const absWorkDir = path.resolve(fallbackWorkDir)
+      const resolvedPath = path.resolve(fallbackWorkDir)
+      const absWorkDir = await fs.realpath(resolvedPath).catch(() => resolvedPath)
       const dirPath = path.join(this.getProjectsDir(), this.sanitizePath(absWorkDir))
       await fs.mkdir(dirPath, { recursive: true })
       found = {
@@ -1461,6 +1472,11 @@ export class SessionService {
     const removedMessageIds = activeMessages
       .slice(startIndex)
       .map((message) => message.id)
+    const remainingMessageIds = new Set(
+      activeMessages
+        .slice(0, startIndex)
+        .map((message) => message.id),
+    )
 
     if (removedMessageIds.length === 0) {
       return { removedCount: 0, removedMessageIds: [] }
@@ -1468,7 +1484,17 @@ export class SessionService {
 
     const removedIds = new Set(removedMessageIds)
     const filteredEntries = entries.filter(
-      (entry) => !(typeof entry.uuid === 'string' && removedIds.has(entry.uuid)),
+      (entry) => {
+        if (typeof entry.uuid !== 'string') return true
+        if (removedIds.has(entry.uuid)) return false
+        if (
+          entry.message?.role &&
+          (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
+        ) {
+          return remainingMessageIds.has(entry.uuid)
+        }
+        return true
+      },
     )
 
     const content =

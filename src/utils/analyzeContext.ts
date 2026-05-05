@@ -48,7 +48,10 @@ import type {
 } from '../types/message.js'
 import { toolToAPISchema } from './api.js'
 import { filterInjectedMemoryFiles, getMemoryFiles } from './claudemd.js'
-import { getContextWindowForModel } from './context.js'
+import {
+  calculateCurrentContextTokenTotal,
+  getContextWindowForModel,
+} from './context.js'
 import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
 import { isEnvTruthy } from './envUtils.js'
@@ -1192,20 +1195,17 @@ export async function analyzeContextUsage(
   // Total for display (everything except free space)
   const totalIncludingReserved = actualUsage
 
-  // Extract API usage from original messages (if provided) to match status line
-  // This uses the same source of truth as the status line for consistency
+  // Extract API usage from original messages (if provided) to anchor the
+  // estimate to the latest provider-reported request size.
   const apiUsage = getCurrentUsage(originalMessages ?? messages)
 
-  // When API usage is available, use it for total to match status line calculation
-  // Status line uses: input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-  const totalFromAPI = apiUsage
-    ? apiUsage.input_tokens +
-      apiUsage.cache_creation_input_tokens +
-      apiUsage.cache_read_input_tokens
-    : null
-
-  // Use API total if available, otherwise fall back to estimated total
-  const finalTotalTokens = totalFromAPI ?? totalIncludingReserved
+  // Use the larger of the local estimate and the latest API-reported context.
+  // This keeps the context meter from dropping when a response completes and
+  // the output tokens become part of the next turn's context.
+  const finalTotalTokens = calculateCurrentContextTokenTotal(
+    totalIncludingReserved,
+    apiUsage,
+  )
 
   // Pre-calculate grid based on model context window and terminal width
   // For narrow screens (< 80 cols), use 5x5 for 200k models, 5x10 for 1M+ models

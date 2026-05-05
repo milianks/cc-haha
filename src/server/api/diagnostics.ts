@@ -3,6 +3,7 @@
  *
  * GET    /api/diagnostics/status       — log directory, retention and counters
  * GET    /api/diagnostics/events       — recent sanitized diagnostic events
+ * POST   /api/diagnostics/events       — append a sanitized client diagnostic event
  * POST   /api/diagnostics/export       — write a sanitized tar.gz bundle
  * POST   /api/diagnostics/open-log-dir — open the diagnostics directory
  * DELETE /api/diagnostics              — clear diagnostics files
@@ -34,6 +35,26 @@ export async function handleDiagnosticsApi(
       return Response.json({ events })
     }
 
+    if (action === 'events' && req.method === 'POST') {
+      const body = await parseJsonBody(req)
+      const type = typeof body.type === 'string' && body.type.trim()
+        ? body.type.trim().slice(0, 128)
+        : 'client_diagnostic_event'
+      const severity = isDiagnosticSeverity(body.severity) ? body.severity : 'error'
+      const summary = typeof body.summary === 'string' && body.summary.trim()
+        ? body.summary
+        : type
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined
+      await diagnosticsService.recordEvent({
+        type,
+        severity,
+        summary,
+        sessionId,
+        details: body.details,
+      })
+      return Response.json({ ok: true })
+    }
+
     if (action === 'export' && req.method === 'POST') {
       return Response.json({ bundle: await diagnosticsService.exportBundle() })
     }
@@ -47,4 +68,17 @@ export async function handleDiagnosticsApi(
   } catch (error) {
     return errorResponse(error)
   }
+}
+
+async function parseJsonBody(req: Request): Promise<Record<string, unknown>> {
+  try {
+    const body = await req.json()
+    return body && typeof body === 'object' ? body as Record<string, unknown> : {}
+  } catch {
+    throw ApiError.badRequest('Invalid JSON body')
+  }
+}
+
+function isDiagnosticSeverity(value: unknown): value is 'debug' | 'info' | 'warn' | 'error' {
+  return value === 'debug' || value === 'info' || value === 'warn' || value === 'error'
 }

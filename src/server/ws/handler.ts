@@ -680,6 +680,10 @@ type SessionStreamState = {
   /** Tool blocks whose input JSON failed to parse in content_block_stop.
    *  The assistant message carries the complete input — defer to that. */
   pendingToolBlocks: Map<string, { toolName: string; toolUseId: string; parentToolUseId?: string }>
+  lastApiError?: {
+    message: string
+    code: string
+  }
 }
 
 const sessionStreamStates = new Map<string, SessionStreamState>()
@@ -692,6 +696,7 @@ function getStreamState(sessionId: string): SessionStreamState {
       activeBlockTypes: new Map(),
       activeToolBlocks: new Map(),
       pendingToolBlocks: new Map(),
+      lastApiError: undefined,
     }
     sessionStreamStates.set(sessionId, state)
   }
@@ -759,6 +764,31 @@ function cacheSessionInitMetadata(sessionId: string, cliMsg: any) {
       description: typeof cmd === 'string' ? '' : (cmd.description || ''),
     })))
   }
+}
+
+function extractAssistantText(cliMsg: any): string {
+  const content = cliMsg?.message?.content
+  if (!Array.isArray(content)) return ''
+  const textBlock = content.find(
+    (block: unknown): block is { type: string; text: string } =>
+      !!block &&
+      typeof block === 'object' &&
+      (block as { type?: unknown }).type === 'text' &&
+      typeof (block as { text?: unknown }).text === 'string',
+  )
+  return textBlock?.text || ''
+}
+
+function isDuplicateOfLastApiError(
+  lastApiError: SessionStreamState['lastApiError'],
+  resultMessage: string,
+): boolean {
+  if (!lastApiError?.message) return false
+  if (resultMessage === lastApiError.message) return true
+  return (
+    resultMessage.includes(lastApiError.message) &&
+    /CLI (?:process exited unexpectedly|exited during startup)/i.test(resultMessage)
+  )
 }
 
 function bindPrewarmMetadataCapture(sessionId: string) {
@@ -831,11 +861,14 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
   const streamState = getStreamState(sessionId)
   switch (cliMsg.type) {
     case 'assistant': {
-      if (cliMsg.error) {
+      if (cliMsg.error || cliMsg.isApiErrorMessage) {
+        const message = extractAssistantText(cliMsg) || cliMsg.error || 'Unknown API error'
+        const code = typeof cliMsg.error === 'string' ? cliMsg.error : 'API_ERROR'
+        streamState.lastApiError = { message, code }
         return [{
           type: 'error',
-          message: cliMsg.message?.content?.[0]?.text || cliMsg.error,
-          code: cliMsg.error,
+          message,
+          code,
         }]
       }
 
@@ -1078,6 +1111,10 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
           (Array.isArray(cliMsg.errors) && cliMsg.errors.length > 0
             ? cliMsg.errors.join('\n')
             : 'Unknown error')
+        if (isDuplicateOfLastApiError(streamState.lastApiError, resultMessage)) {
+          streamState.lastApiError = undefined
+          return [{ type: 'message_complete', usage }]
+        }
         // 错误和完成消息都发送
         return [
           {
@@ -1091,6 +1128,7 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
 
       // Clear stop flag on successful completion too
       sessionStopRequested.delete(sessionId)
+      streamState.lastApiError = undefined
       return [{ type: 'message_complete', usage }]
     }
 

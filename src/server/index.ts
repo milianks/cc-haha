@@ -50,6 +50,7 @@ const HOST = SERVER_OPTIONS.host
 export function startServer(port = PORT, host = HOST) {
   enableConfigs()
   diagnosticsService.installConsoleCapture()
+  diagnosticsService.installProcessCapture()
   ProviderService.setServerPort(port)
   const localConnectHost =
     host === '0.0.0.0' || host === '127.0.0.1' || host === 'localhost'

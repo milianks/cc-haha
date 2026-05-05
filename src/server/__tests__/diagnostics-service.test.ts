@@ -52,6 +52,7 @@ describe('DiagnosticsService', () => {
 
     const runtime = await fs.readFile(path.join(tmpDir, 'yuanclaw', 'diagnostics', 'runtime-errors.log'), 'utf-8')
     expect(runtime).toContain('cli_start_failed')
+    expect(runtime).toContain('"nested"')
     expect(runtime).toContain('[REDACTED]')
     expect(runtime).not.toContain('sk-secret-token')
   })
@@ -82,13 +83,21 @@ describe('DiagnosticsService', () => {
       summary: 'provider failed with token=provider-secret',
       details: { accessToken: 'provider-secret' },
     })
+    await fs.writeFile(
+      path.join(tmpDir, 'yuanclaw', 'diagnostics', 'cli-diagnostics.jsonl'),
+      '{"event":"cli_streaming_idle_timeout","data":{"authorization":"Bearer provider-secret"}}\n',
+      'utf-8',
+    )
 
     const bundle = await service.exportBundle()
     expect(bundle.path).toEndWith('.tar.gz')
     const archiveText = gunzipSync(await fs.readFile(bundle.path)).toString('utf-8')
     expect(archiveText).toContain('README.txt')
+    expect(archiveText).toContain('recent-errors.md')
+    expect(archiveText).toContain('cli-diagnostics.jsonl')
     expect(archiveText).toContain('providers-summary.json')
     expect(archiveText).toContain('sessions-summary.json')
+    expect(archiveText).toContain('cli_streaming_idle_timeout')
     expect(archiveText).toContain('Test Provider')
     expect(archiveText).toContain('api.example.com')
     expect(archiveText).not.toContain('sk-provider-secret')
@@ -108,8 +117,9 @@ describe('diagnostics API', () => {
     const statusReq = makeRequest('GET', '/api/diagnostics/status')
     const statusRes = await handleDiagnosticsApi(statusReq.req, statusReq.url, statusReq.segments)
     expect(statusRes.status).toBe(200)
-    const status = await statusRes.json() as { logDir: string; recentErrorCount: number }
+    const status = await statusRes.json() as { logDir: string; cliDiagnosticsPath: string; recentErrorCount: number }
     expect(status.logDir).toContain(path.join('yuanclaw', 'diagnostics'))
+    expect(status.cliDiagnosticsPath).toContain('cli-diagnostics.jsonl')
     expect(status.recentErrorCount).toBe(1)
 
     const eventsReq = makeRequest('GET', '/api/diagnostics/events?limit=10')
@@ -117,6 +127,28 @@ describe('diagnostics API', () => {
     expect(eventsRes.status).toBe(200)
     const events = await eventsRes.json() as { events: Array<{ type: string }> }
     expect(events.events[0].type).toBe('api_unhandled_error')
+
+    const clientEventReq = new Request('http://localhost:3456/api/diagnostics/events', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client_unhandled_rejection',
+        severity: 'error',
+        summary: 'frontend exploded token=client-secret',
+        details: { accessToken: 'client-secret', stack: 'Error: boom' },
+      }),
+    })
+    const clientEventUrl = new URL(clientEventReq.url)
+    const clientEventRes = await handleDiagnosticsApi(
+      clientEventReq,
+      clientEventUrl,
+      clientEventUrl.pathname.split('/').filter(Boolean),
+    )
+    expect(clientEventRes.status).toBe(200)
+    const clientEvents = await service.readRecentEvents(10)
+    expect(clientEvents[0].type).toBe('client_unhandled_rejection')
+    expect(JSON.stringify(clientEvents[0])).toContain('[REDACTED]')
+    expect(JSON.stringify(clientEvents[0])).not.toContain('client-secret')
 
     const exportReq = makeRequest('POST', '/api/diagnostics/export')
     const exportRes = await handleDiagnosticsApi(exportReq.req, exportReq.url, exportReq.segments)

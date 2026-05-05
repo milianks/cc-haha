@@ -12,6 +12,11 @@ import { ProviderService } from './providerService.js'
 import { sessionService } from './sessionService.js'
 import { diagnosticsService } from './diagnosticsService.js'
 
+const MAX_CAPTURED_PROCESS_LINES = 80
+const MAX_CAPTURED_SDK_MESSAGES = 40
+const MAX_CAPTURED_SDK_SUMMARY = 20
+const CONTROL_READY_POLL_MS = 50
+
 type AttachmentRef = {
   type: 'file' | 'image'
   name?: string
@@ -128,15 +133,15 @@ export class ConversationService {
       )
     }
 
-    if (shouldReplacePlaceholder) {
-      await sessionService.deleteSessionFile(sessionId)
-    }
-
     if (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory()) {
       throw new ConversationStartupError(
         `Working directory does not exist or is not a directory: ${workDir}`,
         'WORKDIR_INVALID',
       )
+    }
+
+    if (shouldReplacePlaceholder) {
+      await sessionService.clearSessionTranscript(sessionId, workDir)
     }
 
     const args = this.buildSessionCliArgs(
@@ -371,7 +376,31 @@ export class ConversationService {
     })
   }
 
-  requestControl(
+  private isControlChannelReady(session: SessionProcess): boolean {
+    return Boolean(session.sdkSocket)
+  }
+
+  private async waitForControlChannelReady(
+    sessionId: string,
+    timeoutMs: number,
+  ): Promise<void> {
+    const startedAt = Date.now()
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const session = this.sessions.get(sessionId)
+      if (!session) {
+        throw new Error('CLI session is not running')
+      }
+      if (this.isControlChannelReady(session)) {
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, CONTROL_READY_POLL_MS))
+    }
+
+    throw new Error('Timed out waiting for CLI control channel to become ready')
+  }
+
+  async requestControl(
     sessionId: string,
     request: Record<string, unknown>,
     timeoutMs = 10_000,
@@ -380,12 +409,15 @@ export class ConversationService {
       return Promise.reject(new Error('CLI session is not running'))
     }
 
+    const startedAt = Date.now()
+    await this.waitForControlChannelReady(sessionId, timeoutMs)
+    const responseTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.removeOutputCallback(sessionId, handleOutput)
         reject(new Error(`Timed out waiting for ${String(request.subtype ?? 'control')} response`))
-      }, timeoutMs)
+      }, responseTimeoutMs)
 
       const finish = (fn: () => void) => {
         clearTimeout(timeout)
@@ -484,8 +516,18 @@ export class ConversationService {
       try {
         const msg = JSON.parse(line)
         session.sdkMessages.push(msg)
-        if (session.sdkMessages.length > 40) {
-          session.sdkMessages.splice(0, 20)
+        if (session.sdkMessages.length > MAX_CAPTURED_SDK_MESSAGES) {
+          session.sdkMessages.splice(0, session.sdkMessages.length - MAX_CAPTURED_SDK_MESSAGES)
+        }
+        const sdkError = this.extractSdkErrorEvent(msg)
+        if (sdkError) {
+          void diagnosticsService.recordEvent({
+            type: sdkError.type,
+            severity: 'error',
+            sessionId,
+            summary: sdkError.summary,
+            details: sdkError.details,
+          })
         }
         if (msg?.type === 'system' && msg.subtype === 'init') {
           session.initMessage = msg
@@ -528,9 +570,27 @@ export class ConversationService {
     }
   }
 
+  async stopSessionAndWait(sessionId: string, timeoutMs = 2_000): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+
+    this.sessions.delete(sessionId)
+    session.proc.kill()
+
+    await Promise.race([
+      session.proc.exited.catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ])
+    await this.waitForProcessOutputDrain(session, timeoutMs)
+  }
+
   markSessionDeleted(sessionId: string): void {
     this.deletedSessions.add(sessionId)
     this.stopSession(sessionId)
+  }
+
+  unmarkSessionDeleted(sessionId: string): void {
+    this.deletedSessions.delete(sessionId)
   }
 
   getActiveSessions(): string[] {
@@ -564,8 +624,8 @@ export class ConversationService {
             const lines =
               streamName === 'stderr' ? session.stderrLines : session.stdoutLines
             lines.push(this.redactProcessOutput(line))
-            if (lines.length > 20) {
-              lines.splice(0, 10)
+            if (lines.length > MAX_CAPTURED_PROCESS_LINES) {
+              lines.splice(0, lines.length - MAX_CAPTURED_PROCESS_LINES)
             }
           }
         }
@@ -712,6 +772,8 @@ export class ConversationService {
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
       'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
       'YUANCLAW_SEND_DISABLED_THINKING',
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
     ] as const
 
     const cleanEnv = { ...process.env }
@@ -740,10 +802,18 @@ export class ConversationService {
       explicitProviderEnv.ANTHROPIC_MODEL = options.model.trim()
     }
 
+    const cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
+    try {
+      fs.mkdirSync(path.dirname(cliDiagnosticsPath), { recursive: true })
+    } catch {
+      // Diagnostics must never block session startup.
+    }
+
     return {
       ...cleanEnv,
       CLAUDE_CODE_ENABLE_TASKS: '1',
       CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: '1',
+      CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath,
       CALLER_DIR: workDir,
       PWD: workDir,
       ...(sdkUrl
@@ -836,6 +906,8 @@ export class ConversationService {
         'ANTHROPIC_DEFAULT_OPUS_MODEL',
         'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
         'YUANCLAW_SEND_DISABLED_THINKING',
+        'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
       ].some((key) => typeof env[key] === 'string' && env[key]!.trim().length > 0)
     } catch {
       return false
@@ -929,11 +1001,15 @@ export class ConversationService {
     const resultMessage = [...recentMessages]
       .reverse()
       .find((msg) => msg?.type === 'result' && msg.is_error)
+    const assistantApiError = [...recentMessages]
+      .reverse()
+      .find((msg) => this.isAssistantApiErrorMessage(msg))
     const authStatus = [...recentMessages]
       .reverse()
       .find((msg) => msg?.type === 'auth_status')
     const detail =
       this.extractStartupDetail(resultMessage) ||
+      this.extractAssistantApiErrorDetail(assistantApiError) ||
       this.extractStartupDetail(authStatus) ||
       capturedOutput
 
@@ -973,11 +1049,15 @@ export class ConversationService {
     const resultMessage = [...recentMessages]
       .reverse()
       .find((msg) => msg?.type === 'result' && msg.is_error)
+    const assistantApiError = [...recentMessages]
+      .reverse()
+      .find((msg) => this.isAssistantApiErrorMessage(msg))
     const authStatus = [...recentMessages]
       .reverse()
       .find((msg) => msg?.type === 'auth_status')
     const detail =
       this.extractStartupDetail(resultMessage) ||
+      this.extractAssistantApiErrorDetail(assistantApiError) ||
       this.extractStartupDetail(authStatus) ||
       capturedOutput
 
@@ -1024,18 +1104,120 @@ export class ConversationService {
     return ''
   }
 
+  private isAssistantApiErrorMessage(message: any): boolean {
+    return (
+      message?.type === 'assistant' &&
+      (message.isApiErrorMessage === true || typeof message.error === 'string')
+    )
+  }
+
+  private extractAssistantApiErrorDetail(message: any): string {
+    if (!this.isAssistantApiErrorMessage(message)) return ''
+
+    const text = this.extractAssistantText(message)
+    const error = typeof message.error === 'string' ? message.error : ''
+    if (text && error) return `${error}: ${text}`
+    return text || error
+  }
+
+  private extractAssistantText(message: any): string {
+    const content = message?.message?.content
+    if (!Array.isArray(content)) return ''
+    const textBlock = content.find(
+      (block: unknown): block is { type: string; text: string } =>
+        !!block &&
+        typeof block === 'object' &&
+        (block as { type?: unknown }).type === 'text' &&
+        typeof (block as { text?: unknown }).text === 'string',
+    )
+    return textBlock?.text || ''
+  }
+
+  private extractSdkErrorEvent(message: any): {
+    type: string
+    summary: string
+    details: Record<string, unknown>
+  } | null {
+    if (this.isAssistantApiErrorMessage(message)) {
+      const summary = this.redactProcessOutput(
+        this.extractAssistantApiErrorDetail(message) || 'Assistant API error',
+      )
+      return {
+        type: 'sdk_api_error',
+        summary,
+        details: {
+          sdkType: message.type,
+          error: typeof message.error === 'string' ? message.error : undefined,
+          isApiErrorMessage: message.isApiErrorMessage === true,
+          messageText: this.extractAssistantText(message)
+            ? this.redactProcessOutput(this.extractAssistantText(message))
+            : undefined,
+          errorDetails:
+            typeof message.errorDetails === 'string'
+              ? this.redactProcessOutput(message.errorDetails)
+              : undefined,
+        },
+      }
+    }
+
+    if (message?.type === 'result' && message.is_error) {
+      const summary = this.redactProcessOutput(
+        this.extractStartupDetail(message) || 'SDK result error',
+      )
+      return {
+        type: 'sdk_result_error',
+        summary,
+        details: {
+          sdkType: message.type,
+          subtype: message.subtype,
+          isError: true,
+          result:
+            typeof message.result === 'string'
+              ? this.redactProcessOutput(message.result)
+              : undefined,
+          status:
+            typeof message.status === 'string'
+              ? this.redactProcessOutput(message.status)
+              : undefined,
+          usage: message.usage,
+        },
+      }
+    }
+
+    return null
+  }
+
   private summarizeSdkMessages(messages: any[]): unknown[] {
-    return messages.slice(-10).map((message) => {
+    return messages.slice(-MAX_CAPTURED_SDK_SUMMARY).map((message) => {
       if (!message || typeof message !== 'object') {
         return message
       }
+      const content = Array.isArray(message.message?.content)
+        ? message.message.content.map((block: unknown) => {
+            if (!block || typeof block !== 'object') return block
+            const typedBlock = block as Record<string, unknown>
+            return {
+              type: typedBlock.type,
+              text:
+                typeof typedBlock.text === 'string'
+                  ? this.redactProcessOutput(typedBlock.text)
+                  : undefined,
+            }
+          })
+        : undefined
       return {
         type: message.type,
         subtype: message.subtype,
         is_error: message.is_error,
         status: typeof message.status === 'string' ? message.status : undefined,
-        result: typeof message.result === 'string' ? message.result : undefined,
-        message: typeof message.message === 'string' ? message.message : undefined,
+        result: typeof message.result === 'string' ? this.redactProcessOutput(message.result) : undefined,
+        error: typeof message.error === 'string' ? this.redactProcessOutput(message.error) : undefined,
+        errorDetails:
+          typeof message.errorDetails === 'string'
+            ? this.redactProcessOutput(message.errorDetails)
+            : undefined,
+        message: typeof message.message === 'string' ? this.redactProcessOutput(message.message) : undefined,
+        content,
       }
     })
   }

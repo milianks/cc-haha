@@ -25,9 +25,11 @@ function extractUserText(message: any): string {
 const sdkUrl = getArg('--sdk-url')
 const sessionId = getArg('--session-id') || crypto.randomUUID()
 const initMode = process.env.MOCK_SDK_INIT_MODE || 'on_open'
+const initDelayMs = Number(process.env.MOCK_SDK_INIT_DELAY_MS || '0')
 const streamDelayMs = Number(process.env.MOCK_SDK_STREAM_DELAY_MS || '0')
 const exitAfterOpenMs = Number(process.env.MOCK_SDK_EXIT_AFTER_OPEN_MS || '0')
 const exitAfterFirstUserMs = Number(process.env.MOCK_SDK_EXIT_AFTER_FIRST_USER_MS || '0')
+const mcpStatusDelayMs = Number(process.env.MOCK_SDK_MCP_STATUS_DELAY_MS || '0')
 const startupStdout = process.env.MOCK_SDK_STARTUP_STDOUT || ''
 const exitBeforeSdkMs = Number(process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS || '0')
 let initSent = false
@@ -62,7 +64,11 @@ function sendInit() {
 
 ws.addEventListener('open', () => {
   if (initMode !== 'on_first_user') {
-    sendInit()
+    if (initDelayMs > 0) {
+      setTimeout(sendInit, initDelayMs)
+    } else {
+      sendInit()
+    }
   }
   if (exitAfterOpenMs > 0) {
     setTimeout(() => process.exit(1), exitAfterOpenMs)
@@ -115,6 +121,31 @@ ws.addEventListener('message', (event) => {
             subtype: 'success',
             is_error: false,
             result: 'Context usage',
+            usage: { input_tokens: 0, output_tokens: 0 },
+            session_id: sessionId,
+          })
+          continue
+        }
+        if (text.includes('trigger api error')) {
+          emit(ws, {
+            type: 'assistant',
+            error: 'invalid_request',
+            isApiErrorMessage: true,
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Prompt is too long' }],
+            },
+            session_id: sessionId,
+          })
+          if (text.includes('then exit')) {
+            setTimeout(() => process.exit(1), 10)
+            continue
+          }
+          emit(ws, {
+            type: 'result',
+            subtype: 'success',
+            is_error: true,
+            result: 'Prompt is too long',
             usage: { input_tokens: 0, output_tokens: 0 },
             session_id: sessionId,
           })
@@ -263,6 +294,9 @@ ws.addEventListener('message', (event) => {
       }
 
       if (parsed.type === 'control_request' && parsed.request?.subtype === 'mcp_status') {
+        if (mcpStatusDelayMs > 0) {
+          await delay(mcpStatusDelayMs)
+        }
         emit(ws, {
           type: 'control_response',
           response: {

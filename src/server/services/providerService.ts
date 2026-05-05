@@ -16,6 +16,7 @@ import { openaiChatToAnthropic } from '../proxy/transform/openaiChatToAnthropic.
 import { openaiResponsesToAnthropic } from '../proxy/transform/openaiResponsesToAnthropic.js'
 import type { AnthropicRequest, AnthropicResponse } from '../proxy/transform/types.js'
 import { PROVIDER_PRESETS } from '../config/providerPresets.js'
+import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
 import type {
   SavedProvider,
   ProvidersIndex,
@@ -25,6 +26,7 @@ import type {
   ProviderTestResult,
   ProviderTestStepResult,
   ApiFormat,
+  ProviderAuthStrategy,
 } from '../types/provider.js'
 
 const MANAGED_ENV_KEYS = [
@@ -38,12 +40,58 @@ const MANAGED_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  MODEL_CONTEXT_WINDOWS_ENV_KEY,
 ] as const
 
 const DEFAULT_INDEX: ProvidersIndex = { activeId: null, providers: [] }
+const AUTH_ENV_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'])
 
 function getPresetDefaultEnv(presetId: string): Record<string, string> {
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.defaultEnv ?? {}
+}
+
+function omitAuthEnv(env: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => !AUTH_ENV_KEYS.has(key.toUpperCase())),
+  )
+}
+
+function getPresetAuthStrategy(presetId: string): ProviderAuthStrategy {
+  return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.authStrategy ?? 'auth_token'
+}
+
+function getPresetModelContextWindows(presetId: string): Record<string, number> {
+  return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.modelContextWindows ?? {}
+}
+
+function buildProviderAuthEnv(
+  provider: SavedProvider,
+  presetDefaultEnv: Record<string, string>,
+  needsProxy: boolean,
+): Record<string, string> {
+  if (needsProxy) {
+    return { ANTHROPIC_API_KEY: 'proxy-managed' }
+  }
+
+  const strategy = provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
+  const key = provider.apiKey || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN || presetDefaultEnv.ANTHROPIC_API_KEY || ''
+
+  switch (strategy) {
+    case 'api_key':
+      return key ? { ANTHROPIC_API_KEY: key } : {}
+    case 'auth_token':
+      return key ? { ANTHROPIC_AUTH_TOKEN: key } : {}
+    case 'auth_token_empty_api_key':
+      return {
+        ANTHROPIC_API_KEY: '',
+        ...(key ? { ANTHROPIC_AUTH_TOKEN: key } : {}),
+      }
+    case 'dual_same_token':
+      return key ? { ANTHROPIC_API_KEY: key, ANTHROPIC_AUTH_TOKEN: key } : {}
+    case 'dual_dummy':
+      return { ANTHROPIC_API_KEY: 'dummy', ANTHROPIC_AUTH_TOKEN: 'dummy' }
+  }
 }
 
 function getManagedEnvKeys(): string[] {
@@ -165,9 +213,12 @@ export class ProviderService {
       presetId: input.presetId,
       name: input.name,
       apiKey: input.apiKey,
+      ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
       baseUrl: input.baseUrl,
       apiFormat: input.apiFormat ?? 'anthropic',
       models: input.models,
+      ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
+      ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
 
@@ -186,10 +237,19 @@ export class ProviderService {
       ...existing,
       ...(input.name !== undefined && { name: input.name }),
       ...(input.apiKey !== undefined && { apiKey: input.apiKey }),
+      ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
       ...(input.baseUrl !== undefined && { baseUrl: input.baseUrl }),
       ...(input.apiFormat !== undefined && { apiFormat: input.apiFormat }),
       ...(input.models !== undefined && { models: input.models }),
+      ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
+      ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
       ...(input.notes !== undefined && { notes: input.notes }),
+    }
+    if (input.autoCompactWindow === null) {
+      delete updated.autoCompactWindow
+    }
+    if (input.modelContextWindows === null) {
+      delete updated.modelContextWindows
     }
 
     index.providers[idx] = updated
@@ -251,10 +311,23 @@ export class ProviderService {
       ? `http://127.0.0.1:${ProviderService.serverPort}${proxyPath}`
       : provider.baseUrl
 
+    const modelContextWindows = {
+      ...getPresetModelContextWindows(provider.presetId),
+      ...(provider.modelContextWindows ?? {}),
+    }
+
+    const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
+
     return {
-      ...getPresetDefaultEnv(provider.presetId),
+      ...omitAuthEnv(presetDefaultEnv),
+      ...(provider.autoCompactWindow !== undefined && {
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(provider.autoCompactWindow),
+      }),
+      ...(Object.keys(modelContextWindows).length > 0 && {
+        [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows),
+      }),
       ANTHROPIC_BASE_URL: baseUrl,
-      ANTHROPIC_API_KEY: needsProxy ? 'proxy-managed' : provider.apiKey,
+      ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
       ANTHROPIC_MODEL: provider.models.main,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.models.haiku,
       ANTHROPIC_DEFAULT_SONNET_MODEL: provider.models.sonnet,
@@ -320,8 +393,13 @@ export class ProviderService {
     const index = await this.readIndex()
     if (index.activeId) {
       const provider = index.providers.find(p => p.id === index.activeId)
-      if (provider?.apiKey) {
-        return { hasAuth: true, source: 'yuanclaw-provider', activeProvider: provider.name }
+      if (provider) {
+        const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
+        const needsProxy = provider.apiFormat != null && provider.apiFormat !== 'anthropic'
+        const authEnv = buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy)
+        if (Object.values(authEnv).some(value => value.length > 0)) {
+          return { hasAuth: true, source: 'yuanclaw-provider', activeProvider: provider.name }
+        }
       }
     }
 
@@ -385,31 +463,39 @@ export class ProviderService {
 
   async testProvider(
     id: string,
-    overrides?: { baseUrl?: string; modelId?: string; apiFormat?: ApiFormat },
+    overrides?: { baseUrl?: string; modelId?: string; apiFormat?: ApiFormat; authStrategy?: ProviderAuthStrategy },
   ): Promise<ProviderTestResult> {
     const provider = await this.getProvider(id)
     const baseUrl = overrides?.baseUrl || provider.baseUrl
     const modelId = overrides?.modelId || provider.models.main
     const apiFormat = overrides?.apiFormat ?? provider.apiFormat ?? 'anthropic'
+    const authStrategy = overrides?.authStrategy ?? provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
+    const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
+    const apiKey = provider.apiKey
+      || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN
+      || presetDefaultEnv.ANTHROPIC_API_KEY
+      || (authStrategy === 'dual_dummy' ? 'dummy' : '')
 
-    if (!baseUrl || !provider.apiKey) {
+    if (!baseUrl || !apiKey) {
       return { connectivity: { success: false, latencyMs: 0, error: 'Missing baseUrl or apiKey' } }
     }
     return this.testProviderConfig({
       baseUrl,
-      apiKey: provider.apiKey,
+      apiKey,
       modelId,
+      authStrategy,
       apiFormat,
     })
   }
 
   async testProviderConfig(input: TestProviderInput): Promise<ProviderTestResult> {
     const format: ApiFormat = input.apiFormat ?? 'anthropic'
+    const authStrategy = input.authStrategy ?? 'api_key'
     const base = input.baseUrl.replace(/\/+$/, '')
 
     // ── Step 1: Basic connectivity ───────────────────────────
     // Directly call the upstream API to verify URL, key, and model.
-    const step1 = await this.testConnectivity(base, input.apiKey, input.modelId, format)
+    const step1 = await this.testConnectivity(base, input.apiKey, input.modelId, format, authStrategy)
 
     // If connectivity failed, no point running step 2
     if (!step1.success) {
@@ -434,10 +520,11 @@ export class ProviderService {
     apiKey: string,
     modelId: string,
     format: ApiFormat,
+    authStrategy: ProviderAuthStrategy,
   ): Promise<ProviderTestStepResult> {
     const start = Date.now()
     try {
-      const { url, headers, body } = buildDirectTestRequest(base, apiKey, modelId, format)
+      const { url, headers, body } = buildDirectTestRequest(base, apiKey, modelId, format, authStrategy)
       const response = await fetch(url, {
         method: 'POST',
         headers,
@@ -546,6 +633,7 @@ function buildDirectTestRequest(
   apiKey: string,
   modelId: string,
   format: ApiFormat,
+  authStrategy: ProviderAuthStrategy,
 ): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
   const prompt = 'Say "ok" and nothing else.'
 
@@ -566,8 +654,26 @@ function buildDirectTestRequest(
   // anthropic
   return {
     url: `${base}/v1/messages`,
-    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    headers: {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      ...buildAnthropicAuthHeaders(apiKey, authStrategy),
+    },
     body: { model: modelId, max_tokens: 16, messages: [{ role: 'user', content: prompt }] },
+  }
+}
+
+function buildAnthropicAuthHeaders(apiKey: string, authStrategy: ProviderAuthStrategy): Record<string, string> {
+  switch (authStrategy) {
+    case 'api_key':
+      return { 'x-api-key': apiKey }
+    case 'auth_token':
+    case 'auth_token_empty_api_key':
+      return { Authorization: `Bearer ${apiKey}` }
+    case 'dual_same_token':
+      return { 'x-api-key': apiKey, Authorization: `Bearer ${apiKey}` }
+    case 'dual_dummy':
+      return { 'x-api-key': 'dummy', Authorization: 'Bearer dummy' }
   }
 }
 

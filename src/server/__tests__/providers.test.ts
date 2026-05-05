@@ -2,7 +2,7 @@
  * Unit tests for ProviderService and Providers REST API
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
@@ -153,6 +153,28 @@ describe('ProviderService', () => {
 
       expect(provider.notes).toBe('dev environment')
     })
+
+    test('should preserve optional auto compact window', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({ autoCompactWindow: 64000 }))
+
+      expect(provider.autoCompactWindow).toBe(64000)
+    })
+
+    test('should preserve optional model context windows', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        modelContextWindows: {
+          'model-main': 300000,
+          'model-haiku': 128000,
+        },
+      }))
+
+      expect(provider.modelContextWindows).toEqual({
+        'model-main': 300000,
+        'model-haiku': 128000,
+      })
+    })
   })
 
   // ─── getProvider ─────────────────────────────────────────────────────────
@@ -223,8 +245,61 @@ describe('ProviderService', () => {
       const settings = await readSettings()
       const env = settings.env as Record<string, string>
       expect(env.ANTHROPIC_BASE_URL).toBe('https://new-api.example.com')
-      expect(env.ANTHROPIC_API_KEY).toBe('sk-new-key')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-new-key')
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined()
       expect(env.ANTHROPIC_MODEL).toBe('model-main')
+    })
+
+    test('updating active provider should override and clear auto compact window', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput({ autoCompactWindow: 64000 }))
+      await svc.activateProvider(added.id)
+
+      let settings = await readSettings()
+      let env = settings.env as Record<string, string>
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('64000')
+
+      await svc.updateProvider(added.id, { autoCompactWindow: 32000 })
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('32000')
+
+      await svc.updateProvider(added.id, { autoCompactWindow: null })
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
+    })
+
+    test('updating active provider should override and clear model context windows', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput({
+        modelContextWindows: { 'model-main': 300000 },
+      }))
+      await svc.activateProvider(added.id)
+
+      let settings = await readSettings()
+      let env = settings.env as Record<string, string>
+      expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toEqual({
+        'model-main': 300000,
+      })
+
+      await svc.updateProvider(added.id, {
+        modelContextWindows: { 'model-main': 500000 },
+      })
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toEqual({
+        'model-main': 500000,
+      })
+
+      await svc.updateProvider(added.id, { modelContextWindows: null })
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS).toBeUndefined()
     })
   })
 
@@ -310,11 +385,66 @@ describe('ProviderService', () => {
       const settings = await readSettings()
       const env = settings.env as Record<string, string>
       expect(env.ANTHROPIC_BASE_URL).toBe('https://second-api.example.com')
-      expect(env.ANTHROPIC_API_KEY).toBe('sk-second-key')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-second-key')
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined()
       expect(env.ANTHROPIC_MODEL).toBe('model-main')
       expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('model-haiku')
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('model-sonnet')
       expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('model-opus')
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
+    })
+
+    test('should honor provider auth env strategies on activation and runtime env', async () => {
+      const svc = new ProviderService()
+
+      const apiKeyProvider = await svc.addProvider(sampleInput({
+        apiKey: 'sk-api-key',
+        authStrategy: 'api_key',
+      }))
+      await svc.activateProvider(apiKeyProvider.id)
+      let env = (await readSettings()).env as Record<string, string>
+      expect(env.ANTHROPIC_API_KEY).toBe('sk-api-key')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+
+      const bearerProvider = await svc.addProvider(sampleInput({
+        apiKey: 'sk-bearer',
+        authStrategy: 'auth_token_empty_api_key',
+      }))
+      await svc.activateProvider(bearerProvider.id)
+      env = (await readSettings()).env as Record<string, string>
+      expect(env.ANTHROPIC_API_KEY).toBe('')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-bearer')
+
+      const dualProvider = await svc.addProvider(sampleInput({
+        apiKey: 'sk-dual',
+        authStrategy: 'dual_same_token',
+      }))
+      const runtimeEnv = await svc.getProviderRuntimeEnv(dualProvider.id)
+      expect(runtimeEnv.ANTHROPIC_API_KEY).toBe('sk-dual')
+      expect(runtimeEnv.ANTHROPIC_AUTH_TOKEN).toBe('sk-dual')
+
+      const dummyProvider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        authStrategy: 'dual_dummy',
+      }))
+      const dummyRuntimeEnv = await svc.getProviderRuntimeEnv(dummyProvider.id)
+      expect(dummyRuntimeEnv.ANTHROPIC_API_KEY).toBe('dummy')
+      expect(dummyRuntimeEnv.ANTHROPIC_AUTH_TOKEN).toBe('dummy')
+    })
+
+    test('proxy providers keep proxy-managed auth regardless of auth strategy', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiFormat: 'openai_chat',
+        authStrategy: 'auth_token',
+      }))
+
+      await svc.activateProvider(provider.id)
+
+      const settings = await readSettings()
+      const env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
     })
 
     test('should include preset default env on activation and runtime env', async () => {
@@ -330,16 +460,88 @@ describe('ProviderService', () => {
       const env = settings.env as Record<string, string>
       expect(env.API_TIMEOUT_MS).toBe('3000000')
       expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
+      expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toEqual({
+        'anthropic/claude-sonnet-4.6': 1000000,
+        'anthropic/claude-haiku-4.5:thinking': 200000,
+        'anthropic/claude-opus-4.7': 1000000,
+      })
 
       const runtimeEnv = await svc.getProviderRuntimeEnv(provider.id)
       expect(runtimeEnv.API_TIMEOUT_MS).toBe('3000000')
       expect(runtimeEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+      expect(runtimeEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
+      expect(JSON.parse(runtimeEnv.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toEqual({
+        'anthropic/claude-sonnet-4.6': 1000000,
+        'anthropic/claude-haiku-4.5:thinking': 200000,
+        'anthropic/claude-opus-4.7': 1000000,
+      })
 
       await svc.activateOfficial()
       const clearedSettings = await readSettings()
       const clearedEnv = (clearedSettings.env as Record<string, string> | undefined) ?? {}
       expect(clearedEnv.API_TIMEOUT_MS).toBeUndefined()
       expect(clearedEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined()
+      expect(clearedEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
+      expect(clearedEnv.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS).toBeUndefined()
+    })
+
+    test('auth status treats preset default auth as active provider auth', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        presetId: 'lmstudio',
+        apiKey: '',
+        authStrategy: 'auth_token_empty_api_key',
+        models: {
+          main: 'lmstudio-model',
+          haiku: 'lmstudio-model',
+          sonnet: 'lmstudio-model',
+          opus: 'lmstudio-model',
+        },
+      }))
+      await svc.activateProvider(provider.id)
+
+      const status = await svc.checkAuthStatus()
+
+      expect(status).toEqual({
+        hasAuth: true,
+        source: 'yuanclaw-provider',
+        activeProvider: provider.name,
+      })
+    })
+
+    test('auth status treats dummy proxy auth as active provider auth', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        apiKey: '',
+        apiFormat: 'openai_chat',
+      }))
+      await svc.activateProvider(provider.id)
+
+      const status = await svc.checkAuthStatus()
+
+      expect(status).toEqual({
+        hasAuth: true,
+        source: 'yuanclaw-provider',
+        activeProvider: provider.name,
+      })
+    })
+
+    test('provider auto compact window should override preset default env on activation and runtime env', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        presetId: 'custom',
+        autoCompactWindow: 32000,
+      }))
+
+      await svc.activateProvider(provider.id)
+
+      const settings = await readSettings()
+      const env = settings.env as Record<string, string>
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('32000')
+
+      const runtimeEnv = await svc.getProviderRuntimeEnv(provider.id)
+      expect(runtimeEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('32000')
     })
 
     test('should preserve existing settings.json fields on activation', async () => {
@@ -407,6 +609,102 @@ describe('ProviderService', () => {
       expect(active!.apiFormat).toBe('anthropic')
     })
   })
+
+  describe('testProvider', () => {
+    test('should use preset default auth for saved no-key Anthropic-compatible providers', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ headers: Record<string, string> }> = []
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ headers: init?.headers as Record<string, string> })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'lmstudio-model',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const provider = await svc.addProvider(sampleInput({
+          presetId: 'lmstudio',
+          apiKey: '',
+          authStrategy: 'auth_token_empty_api_key',
+          models: {
+            main: 'lmstudio-model',
+            haiku: 'lmstudio-model',
+            sonnet: 'lmstudio-model',
+            opus: 'lmstudio-model',
+          },
+        }))
+
+        const result = await svc.testProvider(provider.id)
+
+        expect(result.connectivity.success).toBe(true)
+        expect(calls[0].headers.Authorization).toBe('Bearer lmstudio')
+        expect(calls[0].headers['x-api-key']).toBeUndefined()
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
+  describe('testProviderConfig', () => {
+    test('should use auth strategy headers for Anthropic-compatible tests', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ url: string; headers: Record<string, string> }> = []
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          headers: init?.headers as Record<string, string>,
+        })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'model-main',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        await svc.testProviderConfig({
+          baseUrl: 'https://api.example.com/anthropic',
+          apiKey: 'sk-bearer',
+          modelId: 'model-main',
+          authStrategy: 'auth_token',
+          apiFormat: 'anthropic',
+        })
+        await svc.testProviderConfig({
+          baseUrl: 'https://api.example.com/anthropic',
+          apiKey: 'sk-api',
+          modelId: 'model-main',
+          authStrategy: 'api_key',
+          apiFormat: 'anthropic',
+        })
+        await svc.testProviderConfig({
+          baseUrl: 'https://api.example.com/anthropic',
+          apiKey: 'sk-dual',
+          modelId: 'model-main',
+          authStrategy: 'dual_same_token',
+          apiFormat: 'anthropic',
+        })
+
+        expect(calls[0].headers.Authorization).toBe('Bearer sk-bearer')
+        expect(calls[0].headers['x-api-key']).toBeUndefined()
+        expect(calls[1].headers['x-api-key']).toBe('sk-api')
+        expect(calls[1].headers.Authorization).toBeUndefined()
+        expect(calls[2].headers['x-api-key']).toBe('sk-dual')
+        expect(calls[2].headers.Authorization).toBe('Bearer sk-dual')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
 })
 
 // =============================================================================
@@ -452,6 +750,7 @@ describe('Providers API', () => {
       baseUrl: 'https://api.example.com',
       apiKey: 'sk-test',
       apiFormat: 'anthropic',
+      autoCompactWindow: 64000,
       models: {
         main: 'gpt-4',
         haiku: 'gpt-4-haiku',
@@ -462,14 +761,35 @@ describe('Providers API', () => {
     const res = await handleProvidersApi(req, url, segments)
 
     expect(res.status).toBe(201)
-    const body = (await res.json()) as { provider: { name: string; models: { main: string } } }
+    const body = (await res.json()) as { provider: { name: string; models: { main: string }; autoCompactWindow: number } }
     expect(body.provider.name).toBe('New Provider')
     expect(body.provider.models.main).toBe('gpt-4')
+    expect(body.provider.autoCompactWindow).toBe(64000)
   })
 
   test('POST /api/providers should return 400 for invalid input', async () => {
     const { req, url, segments } = makeRequest('POST', '/api/providers', {
       name: '', // invalid: empty name
+    })
+    const res = await handleProvidersApi(req, url, segments)
+
+    expect(res.status).toBe(400)
+  })
+
+  test('POST /api/providers should return 400 for invalid auto compact window', async () => {
+    const { req, url, segments } = makeRequest('POST', '/api/providers', {
+      presetId: 'custom',
+      name: 'New Provider',
+      baseUrl: 'https://api.example.com',
+      apiKey: 'sk-test',
+      apiFormat: 'anthropic',
+      autoCompactWindow: 8000,
+      models: {
+        main: 'gpt-4',
+        haiku: 'gpt-4-haiku',
+        sonnet: 'gpt-4-sonnet',
+        opus: 'gpt-4-opus',
+      },
     })
     const res = await handleProvidersApi(req, url, segments)
 
@@ -566,7 +886,8 @@ describe('Providers API', () => {
     const settings = await readSettings()
     const env = settings.env as Record<string, string>
     expect(env.ANTHROPIC_BASE_URL).toBe('https://second.example.com')
-    expect(env.ANTHROPIC_API_KEY).toBe('sk-second')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-second')
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
     expect(env.ANTHROPIC_MODEL).toBe('model-main')
   })
 

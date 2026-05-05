@@ -5,6 +5,7 @@ import { getGlobalConfig } from './config.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
+import { getConfiguredOrBuiltInModelContextWindow } from './model/modelContextWindows.js'
 
 // Default fallback when the model-specific capability is unknown.
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -37,7 +38,7 @@ export function has1mContext(model: string): boolean {
   if (is1mContextDisabled()) {
     return false
   }
-  return /\[1m\]/i.test(model)
+  return /\[1m\]/i.test(model) || /:1m$/i.test(model)
 }
 
 // @[MODEL LAUNCH]: Update this pattern if the new model supports 1M context
@@ -70,6 +71,17 @@ export function getContextWindowForModel(
   // [1m] suffix — explicit client-side opt-in, respected over all detection
   if (has1mContext(model)) {
     return 1_000_000
+  }
+
+  const configuredWindow = getConfiguredOrBuiltInModelContextWindow(model)
+  if (configuredWindow !== undefined) {
+    if (
+      configuredWindow > MODEL_CONTEXT_WINDOW_DEFAULT &&
+      is1mContextDisabled()
+    ) {
+      return MODEL_CONTEXT_WINDOW_DEFAULT
+    }
+    return configuredWindow
   }
 
   const openAIContextWindow = getOpenAIContextWindowForModel(model)
@@ -147,6 +159,36 @@ export function calculateContextPercentages(
     used: clampedUsed,
     remaining: 100 - clampedUsed,
   }
+}
+
+/**
+ * Calculate the current context size after the latest assistant response.
+ *
+ * API usage reports the prompt tokens used for the just-finished request plus
+ * that request's output tokens. The output becomes part of the next request's
+ * conversation context, so omitting it can make context usage appear to drop
+ * immediately after the model finishes responding. The local estimate is kept
+ * as a lower bound because it includes system/tool/message material that some
+ * provider usage payloads under-report.
+ */
+export function calculateCurrentContextTokenTotal(
+  estimatedTokens: number,
+  currentUsage: {
+    input_tokens: number
+    output_tokens?: number
+    cache_creation_input_tokens: number
+    cache_read_input_tokens: number
+  } | null,
+): number {
+  if (!currentUsage) return estimatedTokens
+
+  const totalFromAPI =
+    currentUsage.input_tokens +
+    currentUsage.cache_creation_input_tokens +
+    currentUsage.cache_read_input_tokens +
+    (currentUsage.output_tokens ?? 0)
+
+  return Math.max(estimatedTokens, totalFromAPI)
 }
 
 /**
