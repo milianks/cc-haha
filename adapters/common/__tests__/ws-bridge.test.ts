@@ -47,6 +47,11 @@ describe('WsBridge', () => {
     expect(bridge.sendStopGeneration('chat-stop')).toBe(false)
   })
 
+  it('sendRuntimeConfig returns false when no open connection', () => {
+    bridge.connectSession('chat-runtime', 'uuid-runtime')
+    expect(bridge.sendRuntimeConfig('chat-runtime', 'provider-1', 'gpt-5.5')).toBe(false)
+  })
+
   it('destroy cleans up all sessions', () => {
     bridge.connectSession('a', 'uuid-a')
     bridge.connectSession('b', 'uuid-b')
@@ -171,6 +176,28 @@ describe('WsBridge: handler serialization', () => {
 
     bridge.resetSession('chat-reset')
     expect(bridge.hasSession('chat-reset')).toBe(false)
+
+    bridge.destroy()
+  })
+
+  it('sends runtime config messages over an open connection', async () => {
+    const bridge = new WsBridge(serverUrl, 'test')
+    const received = new Promise<any>((resolve) => {
+      server.on('connection', (ws) => {
+        ws.once('message', (raw) => resolve(JSON.parse(raw.toString())))
+      })
+    })
+
+    bridge.connectSession('chat-runtime', 'sess-runtime')
+    const ok = await bridge.waitForOpen('chat-runtime')
+    expect(ok).toBe(true)
+
+    expect(bridge.sendRuntimeConfig('chat-runtime', 'provider-openai', 'gpt-5.5')).toBe(true)
+    expect(await received).toEqual({
+      type: 'set_runtime_config',
+      providerId: 'provider-openai',
+      modelId: 'gpt-5.5',
+    })
 
     bridge.destroy()
   })

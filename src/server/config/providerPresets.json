@@ -209,6 +209,48 @@
     }
   },
   {
+    "id": "openai",
+    "name": "OpenAI",
+    "baseUrl": "https://api.openai.com",
+    "apiFormat": "openai_responses",
+    "defaultModels": {
+      "main": "gpt-5.2",
+      "haiku": "gpt-5-mini",
+      "sonnet": "gpt-5.2",
+      "opus": "gpt-5.2"
+    },
+    "needsApiKey": true,
+    "websiteUrl": "https://platform.openai.com",
+    "apiKeyUrl": "https://platform.openai.com/api-keys",
+    "promoText": "OpenAI Responses API 通过 yuanclaw 内置协议转换代理直连，无需 LiteLLM。激活后 CLI 仍发送 Anthropic Messages 请求，server 会转发到 /v1/responses。",
+    "authStrategy": "auth_token",
+    "defaultEnv": {
+      "API_TIMEOUT_MS": "3000000",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    }
+  },
+  {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "baseUrl": "https://openrouter.ai/api",
+    "apiFormat": "openai_chat",
+    "defaultModels": {
+      "main": "openai/gpt-4o",
+      "haiku": "openai/gpt-4o-mini",
+      "sonnet": "openai/gpt-4o",
+      "opus": "openai/gpt-4o"
+    },
+    "needsApiKey": true,
+    "websiteUrl": "https://openrouter.ai",
+    "apiKeyUrl": "https://openrouter.ai/settings/keys",
+    "promoText": "OpenRouter 使用 OpenAI Chat Completions 协议，通过 yuanclaw 内置协议转换代理直连。model 使用 provider/model 格式。",
+    "authStrategy": "auth_token",
+    "defaultEnv": {
+      "API_TIMEOUT_MS": "3000000",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    }
+  },
+  {
     "id": "custom",
     "name": "Custom",
     "baseUrl": "",

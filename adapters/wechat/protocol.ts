@@ -286,6 +286,22 @@ export async function sendWechatText(params: {
   assertWechatApiOk(rawText, 'wechatSendMessage')
 }
 
+export async function createWechatMenu(params: {
+  baseUrl: string
+  token: string
+  menu: Record<string, unknown>
+  timeoutMs?: number
+}): Promise<void> {
+  const rawText = await apiPostFetch({
+    baseUrl: params.baseUrl,
+    endpoint: `cgi-bin/menu/create?access_token=${encodeURIComponent(params.token)}`,
+    body: JSON.stringify(params.menu),
+    timeoutMs: params.timeoutMs ?? API_TIMEOUT_MS,
+    label: 'wechatMenuCreate',
+  })
+  assertWechatApiOk(rawText, 'wechatMenuCreate')
+}
+
 export async function getWechatConfig(params: {
   baseUrl: string
   token: string

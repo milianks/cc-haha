@@ -27,16 +27,46 @@ import {
 } from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient } from '../common/http-client.js'
+import {
+  formatRuntimeModelList,
+  selectRuntimeModelOption,
+} from '../common/llm-command.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
+import { retryTelegramApi } from './bot-api.js'
 import { TelegramMediaService } from './media.js'
 import { AttachmentStore } from '../common/attachment/attachment-store.js'
 import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
+import {
+  buildTelegramMenuCommands,
+  buildTelegramSlashCommands,
+  fitTelegramCommandsWithinTextBudget,
+  syncTelegramMenuCommands,
+  type TelegramSyncApi,
+  TELEGRAM_TOTAL_COMMAND_TEXT_BUDGET,
+  BUILTIN_TELEGRAM_COMMANDS,
+} from '../common/slash-commands.js'
 import type { AttachmentRef } from '../common/ws-bridge.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
 import * as fs from 'node:fs/promises'
 
 const TELEGRAM_TEXT_LIMIT = 4000 // leave margin below 4096
+
+async function tgSendMessage(
+  chatId: number,
+  text: string,
+  other?: Parameters<typeof bot.api.sendMessage>[2],
+) {
+  return await retryTelegramApi(() => bot.api.sendMessage(chatId, text, other))
+}
+
+async function tgEditMessageText(chatId: number, messageId: number, text: string) {
+  return await retryTelegramApi(() => bot.api.editMessageText(chatId, messageId, text))
+}
+
+async function tgAnswerCallbackQuery(callbackQueryId: string, text: string) {
+  return await retryTelegramApi(() => bot.api.answerCallbackQuery(callbackQueryId, { text }))
+}
 
 // ---------- init ----------
 
@@ -70,6 +100,7 @@ const runtimeStates = new Map<string, ChatRuntimeState>()
 const pendingPermissions = new Map<string, Set<string>>()
 /** Per-chat outbound image watcher for Agent-produced markdown images. */
 const tgImageWatchers = new Map<string, ImageBlockWatcher>()
+let lastDynamicSlashCommandsData: unknown = null
 
 function getTgWatcher(chatId: string): ImageBlockWatcher {
   let w = tgImageWatchers.get(chatId)
@@ -109,6 +140,71 @@ function getRuntimeState(chatId: string): ChatRuntimeState {
   return state
 }
 
+function buildTelegramSyncApi(): TelegramSyncApi {
+  return {
+    deleteMyCommands: async (scope) => {
+      if (scope) {
+        return await retryTelegramApi(() => bot.api.deleteMyCommands({ scope }))
+      }
+      return await retryTelegramApi(() => bot.api.deleteMyCommands())
+    },
+    setMyCommands: async (commands, scope) => {
+      if (scope) {
+        return await retryTelegramApi(() => bot.api.setMyCommands(commands, { scope }))
+      }
+      return await retryTelegramApi(() => bot.api.setMyCommands(commands))
+    },
+  }
+}
+
+async function registerTelegramSlashCommands(data: unknown): Promise<void> {
+  lastDynamicSlashCommandsData = data
+  const allCommands = buildTelegramMenuCommands(data)
+  const { commands: commandsToRegister, descriptionTrimmed, textBudgetDropCount } =
+    fitTelegramCommandsWithinTextBudget(allCommands, TELEGRAM_TOTAL_COMMAND_TEXT_BUDGET)
+
+  if (descriptionTrimmed) {
+    console.log('[Telegram] Menu text exceeded budget; shortening descriptions')
+  }
+  if (textBudgetDropCount > 0) {
+    console.log(`[Telegram] Dropped ${textBudgetDropCount} command(s) to stay within text budget`)
+  }
+
+  syncTelegramMenuCommands({
+    api: buildTelegramSyncApi(),
+    commandsToRegister,
+    onLog: (msg) => console.log(msg),
+    onError: (msg) => console.warn(msg),
+  })
+}
+
+async function syncTelegramSlashCommands(sessionId: string): Promise<void> {
+  try {
+    const commands = await httpClient.getSessionSlashCommands(sessionId)
+    await registerTelegramSlashCommands(commands)
+  } catch (err) {
+    console.warn(
+      `[Telegram] Failed to sync slash commands for ${sessionId}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/** Register builtin commands at startup so the "/" menu is populated
+ *  immediately, before any WebSocket notification arrives. */
+function registerStartupSlashCommands(): void {
+  const allCommands = buildTelegramMenuCommands(null)
+  const { commands: commandsToRegister } =
+    fitTelegramCommandsWithinTextBudget(allCommands, TELEGRAM_TOTAL_COMMAND_TEXT_BUDGET)
+
+  syncTelegramMenuCommands({
+    api: buildTelegramSyncApi(),
+    commandsToRegister,
+    onLog: (msg) => console.log(msg),
+    onError: (msg) => console.warn(msg),
+  })
+}
+
 function clearTransientChatState(chatId: string): void {
   placeholders.delete(chatId)
   accumulatedText.delete(chatId)
@@ -124,7 +220,7 @@ function clearTransientChatState(chatId: string): void {
 async function handlePermissionDecision(chatId: string, decision: PermissionDecision): Promise<void> {
   const pending = pendingPermissions.get(chatId)
   if (!pending?.has(decision.requestId)) {
-    await bot.api.sendMessage(Number(chatId), `未找到待确认的权限请求：${decision.requestId}`)
+    await tgSendMessage(Number(chatId), `未找到待确认的权限请求：${decision.requestId}`)
     return
   }
 
@@ -134,7 +230,7 @@ async function handlePermissionDecision(chatId: string, decision: PermissionDeci
     const runtime = getRuntimeState(chatId)
     runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
   }
-  await bot.api.sendMessage(
+  await tgSendMessage(
     Number(chatId),
     sent ? `${formatPermissionDecisionStatus(decision)}。` : '权限响应发送失败，请检查会话状态。',
   )
@@ -217,21 +313,21 @@ async function flushToTelegram(chatId: string, newText: string, isComplete: bool
     if (isComplete) {
       const chunks = splitMessage(fullText, TELEGRAM_TEXT_LIMIT)
       try {
-        await bot.api.editMessageText(numericChatId, placeholder.messageId, chunks[0]!)
+        await tgEditMessageText(numericChatId, placeholder.messageId, chunks[0]!)
       } catch { /* ignore */ }
       for (let i = 1; i < chunks.length; i++) {
-        await bot.api.sendMessage(numericChatId, chunks[i]!)
+        await tgSendMessage(numericChatId, chunks[i]!)
       }
     } else {
       const displayText = fullText.slice(0, TELEGRAM_TEXT_LIMIT - 2) + ' ▍'
       try {
-        await bot.api.editMessageText(numericChatId, placeholder.messageId, displayText)
+        await tgEditMessageText(numericChatId, placeholder.messageId, displayText)
       } catch { /* ignore */ }
     }
   } else if (isComplete && fullText.trim()) {
     const chunks = splitMessage(fullText, TELEGRAM_TEXT_LIMIT)
     for (const chunk of chunks) {
-      await bot.api.sendMessage(numericChatId, chunk)
+      await tgSendMessage(numericChatId, chunk)
     }
   }
 
@@ -277,12 +373,13 @@ async function createSessionForChat(chatId: string, workDir: string): Promise<bo
     bridge.onServerMessage(chatId, (msg) => handleServerMessage(chatId, msg))
     const opened = await bridge.waitForOpen(chatId)
     if (!opened) {
-      await bot.api.sendMessage(numericChatId, '⚠️ 连接服务器超时，请重试。')
+      await tgSendMessage(numericChatId, '⚠️ 连接服务器超时，请重试。')
       return false
     }
+    await syncTelegramSlashCommands(sessionId)
     return true
   } catch (err) {
-    await bot.api.sendMessage(numericChatId,
+    await tgSendMessage(numericChatId,
       `❌ 无法创建会话: ${err instanceof Error ? err.message : String(err)}`)
     return false
   }
@@ -293,7 +390,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
   try {
     const projects = await httpClient.listRecentProjects()
     if (projects.length === 0) {
-      await bot.api.sendMessage(numericChatId,
+      await tgSendMessage(numericChatId,
         `没有找到最近的项目。发送 /new 会使用默认工作目录：${defaultWorkDir}\n也可以发送 /new /path/to/project 指定项目。`)
       return
     }
@@ -302,10 +399,10 @@ async function showProjectPicker(chatId: string): Promise<void> {
       `${i + 1}. ${p.projectName}${p.branch ? ` (${p.branch})` : ''}\n   ${p.realPath}`
     )
     pendingProjectSelection.set(chatId, true)
-    await bot.api.sendMessage(numericChatId,
+    await tgSendMessage(numericChatId,
       `选择项目（回复编号）：\n\n${lines.join('\n\n')}\n\n💡 下次可直接 /new <编号、名称或绝对路径> 快速新建会话`)
   } catch (err) {
-    await bot.api.sendMessage(numericChatId,
+    await tgSendMessage(numericChatId,
       `❌ 无法获取项目列表: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
@@ -370,7 +467,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
       runtime.state = msg.state
       runtime.verb = typeof msg.verb === 'string' ? msg.verb : undefined
       if (msg.state === 'thinking' && !placeholders.has(chatId)) {
-        const sent = await bot.api.sendMessage(numericChatId, '💭 思考中...')
+        const sent = await tgSendMessage(numericChatId, '💭 思考中...')
         placeholders.set(chatId, { chatId, messageId: sent.message_id })
         accumulatedText.set(chatId, '')
       }
@@ -379,7 +476,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'content_start':
       if (msg.blockType === 'text') {
         if (!placeholders.has(chatId)) {
-          const sent = await bot.api.sendMessage(numericChatId, '▍')
+          const sent = await tgSendMessage(numericChatId, '▍')
           placeholders.set(chatId, { chatId, messageId: sent.message_id })
           accumulatedText.set(chatId, '')
         }
@@ -392,7 +489,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           const text = accumulatedText.get(chatId)
           if (text?.trim()) {
             try {
-              await bot.api.editMessageText(numericChatId, placeholders.get(chatId)!.messageId, text)
+              await tgEditMessageText(numericChatId, placeholders.get(chatId)!.messageId, text)
             } catch { /* ignore */ }
           }
           placeholders.delete(chatId)
@@ -415,7 +512,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'thinking':
       if (placeholders.has(chatId)) {
         try {
-          await bot.api.editMessageText(
+          await tgEditMessageText(
             numericChatId,
             placeholders.get(chatId)!.messageId,
             `💭 ${msg.text.slice(0, 200)}...`,
@@ -445,7 +542,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         .text('♾️ 永久允许', `permit:${msg.requestId}:always`)
         .row()
         .text('❌ 拒绝', `permit:${msg.requestId}:no`)
-      await bot.api.sendMessage(numericChatId, text, { reply_markup: keyboard })
+      await tgSendMessage(numericChatId, text, { reply_markup: keyboard })
       break
     }
 
@@ -459,9 +556,9 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         if (text?.trim()) {
           try {
             const chunks = splitMessage(text, TELEGRAM_TEXT_LIMIT)
-            await bot.api.editMessageText(numericChatId, placeholders.get(chatId)!.messageId, chunks[0]!)
+            await tgEditMessageText(numericChatId, placeholders.get(chatId)!.messageId, chunks[0]!)
             for (let i = 1; i < chunks.length; i++) {
-              await bot.api.sendMessage(numericChatId, chunks[i]!)
+              await tgSendMessage(numericChatId, chunks[i]!)
             }
           } catch { /* ignore */ }
         }
@@ -480,21 +577,21 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         const stored = sessionStore.get(chatId)
         const workDir = stored?.workDir || defaultWorkDir
         if (workDir) {
-          await bot.api.sendMessage(numericChatId, '⚠️ 会话上下文已失效，正在自动重建...')
+          await tgSendMessage(numericChatId, '⚠️ 会话上下文已失效，正在自动重建...')
           clearTransientChatState(chatId)
           bridge.resetSession(chatId)
           sessionStore.delete(chatId)
           const ok = await createSessionForChat(chatId, workDir)
           if (ok) {
-            await bot.api.sendMessage(numericChatId, '✅ 已重建会话，请重新发送消息。')
+            await tgSendMessage(numericChatId, '✅ 已重建会话，请重新发送消息。')
           } else {
-            await bot.api.sendMessage(numericChatId, '❌ 重建会话失败，请发送 /new 手动新建。')
+            await tgSendMessage(numericChatId, '❌ 重建会话失败，请发送 /new 手动新建。')
           }
         } else {
-          await bot.api.sendMessage(numericChatId, '⚠️ 会话上下文已失效，请发送 /new 新建会话。')
+          await tgSendMessage(numericChatId, '⚠️ 会话上下文已失效，请发送 /new 新建会话。')
         }
       } else {
-        await bot.api.sendMessage(numericChatId, `❌ ${msg.message}`)
+        await tgSendMessage(numericChatId, `❌ ${msg.message}`)
       }
       break
 
@@ -504,6 +601,8 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         if (typeof model === 'string' && model.trim()) {
           runtime.model = model
         }
+      } else if (msg.subtype === 'slash_commands') {
+        await registerTelegramSlashCommands(msg.data)
       }
       break
   }
@@ -541,19 +640,19 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
       if (project) {
         const ok = await createSessionForChat(chatId, project.realPath)
         if (ok) {
-          await bot.api.sendMessage(numericChatId,
+          await tgSendMessage(numericChatId,
             `✅ 已新建会话：${project.projectName}${project.branch ? ` (${project.branch})` : ''}`)
         }
         return
       }
       if (ambiguous) {
         const list = ambiguous.map((p, i) => `${i + 1}. ${p.projectName} — ${p.realPath}`).join('\n')
-        await bot.api.sendMessage(numericChatId, `匹配到多个项目，请更精确：\n\n${list}`)
+        await tgSendMessage(numericChatId, `匹配到多个项目，请更精确：\n\n${list}`)
         return
       }
-      await bot.api.sendMessage(numericChatId, `未找到匹配 "${query}" 的项目。发送 /projects 查看完整列表。`)
+      await tgSendMessage(numericChatId, `未找到匹配 "${query}" 的项目。发送 /projects 查看完整列表。`)
     } catch (err) {
-      await bot.api.sendMessage(numericChatId,
+      await tgSendMessage(numericChatId,
         `❌ ${err instanceof Error ? err.message : String(err)}`)
     }
   } else {
@@ -561,7 +660,7 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
     if (workDir) {
       const ok = await createSessionForChat(chatId, workDir)
       if (ok) {
-        await bot.api.sendMessage(numericChatId, '✅ 已新建会话，可以开始对话了。')
+        await tgSendMessage(numericChatId, '✅ 已新建会话，可以开始对话了。')
       }
     } else {
       await showProjectPicker(chatId)
@@ -595,6 +694,56 @@ bot.command('stop', (ctx) => {
 bot.command('status', async (ctx) => {
   const chatId = String(ctx.chat.id)
   await ctx.reply(await buildStatusText(chatId))
+})
+
+bot.command('llm', async (ctx) => {
+  if (!ctx.from || ctx.chat?.type !== 'private') return
+
+  const userId = ctx.from.id
+  if (!isAllowedUser('telegram', userId)) {
+    await ctx.reply('🔒 未授权。请在 Claude Code 桌面端生成配对码后发送给我。')
+    return
+  }
+
+  const chatId = String(ctx.chat.id)
+  const query = ctx.match?.trim() || ''
+
+  enqueue(chatId, async () => {
+    try {
+      const options = await httpClient.listRuntimeModelOptions()
+      if (!query) {
+        await ctx.reply(formatRuntimeModelList(options))
+        return
+      }
+
+      const selection = selectRuntimeModelOption(options, query)
+      if (!selection) {
+        await ctx.reply(`未找到匹配 "${query}" 的模型。\n\n${formatRuntimeModelList(options)}`)
+        return
+      }
+
+      if (selection.ambiguous) {
+        await ctx.reply(`匹配到多个模型，请更精确：\n\n${formatRuntimeModelList(selection.ambiguous)}`)
+        return
+      }
+
+      const ready = await ensureSession(chatId)
+      if (!ready) return
+
+      const { option } = selection
+      const sent = bridge.sendRuntimeConfig(chatId, option.providerId, option.modelId)
+      if (!sent) {
+        await ctx.reply('⚠️ 模型切换发送失败，请先发送 /new 重新连接会话。')
+        return
+      }
+
+      const runtime = getRuntimeState(chatId)
+      runtime.model = option.modelId
+      await ctx.reply(`✅ 已切换当前会话模型：${option.providerName} / ${option.modelId}`)
+    } catch (err) {
+      await ctx.reply(`❌ 无法处理 /llm：${err instanceof Error ? err.message : String(err)}`)
+    }
+  })
 })
 
 bot.command('clear', (ctx) => {
@@ -666,7 +815,7 @@ async function routeUserMessage(
     if (!effective && attachments.length === 0) return
     const sent = bridge.sendUserMessage(chatId, effective, attachments.length ? attachments : undefined)
     if (!sent) {
-      await bot.api.sendMessage(Number(chatId), '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
+      await tgSendMessage(Number(chatId), '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
     }
   })
 }
@@ -778,7 +927,7 @@ bot.on('callback_query:data', async (ctx) => {
     )
   } catch { /* ignore */ }
 
-  await ctx.answerCallbackQuery(statusText)
+  await tgAnswerCallbackQuery(ctx.callbackQuery.id, statusText)
 })
 
 // ---------- start ----------
@@ -787,15 +936,20 @@ console.log('[Telegram] Starting bot...')
 console.log(`[Telegram] Server: ${config.serverUrl}`)
 console.log(`[Telegram] Allowed users: ${config.telegram.allowedUsers.length === 0 ? 'all' : config.telegram.allowedUsers.join(', ')}`)
 
+// Register builtin commands at startup so the "/" menu appears immediately.
+registerStartupSlashCommands()
+
 bot.start({
   onStart: () => console.log('[Telegram] Bot is running!'),
 })
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+function shutdown() {
   console.log('[Telegram] Shutting down...')
   bot.stop()
   bridge.destroy()
   dedup.destroy()
   process.exit(0)
-})
+}
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)

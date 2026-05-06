@@ -72,6 +72,10 @@ export function getSlashCommands(sessionId: string): Array<{ name: string; descr
   return sessionSlashCommands.get(sessionId) || []
 }
 
+export function __testCacheSlashCommands(sessionId: string, commands: Array<{ name: string; description: string }>): void {
+  sessionSlashCommands.set(sessionId, commands)
+}
+
 export type WebSocketData = {
   sessionId: string
   connectedAt: number
@@ -119,6 +123,7 @@ export const handleWebSocket = {
 
     const msg: ServerMessage = { type: 'connected', sessionId }
     ws.send(JSON.stringify(msg))
+    replayCachedSlashCommands(sessionId, ws)
   },
 
   message(ws: ServerWebSocket<WebSocketData>, rawMessage: string | Buffer) {
@@ -1231,6 +1236,16 @@ function sendMessage(ws: ServerWebSocket<WebSocketData>, message: ServerMessage)
 
 function sendError(ws: ServerWebSocket<WebSocketData>, message: string, code: string) {
   sendMessage(ws, { type: 'error', message, code })
+}
+
+function replayCachedSlashCommands(sessionId: string, ws: ServerWebSocket<WebSocketData>): void {
+  const commands = sessionSlashCommands.get(sessionId)
+  if (!commands?.length) return
+  sendMessage(ws, {
+    type: 'system_notification',
+    subtype: 'slash_commands',
+    data: commands,
+  })
 }
 
 function addActiveClient(sessionId: string, ws: ServerWebSocket<WebSocketData>) {

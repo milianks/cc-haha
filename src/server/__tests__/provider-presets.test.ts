@@ -55,8 +55,10 @@ describe('provider presets API', () => {
   })
 
   test('local Anthropic-compatible presets appear immediately before custom', () => {
-    expect(PROVIDER_PRESETS.at(-3)?.id).toBe('lmstudio')
-    expect(PROVIDER_PRESETS.at(-2)?.id).toBe('ollama')
+    expect(PROVIDER_PRESETS.at(-5)?.id).toBe('lmstudio')
+    expect(PROVIDER_PRESETS.at(-4)?.id).toBe('ollama')
+    expect(PROVIDER_PRESETS.at(-3)?.id).toBe('openai')
+    expect(PROVIDER_PRESETS.at(-2)?.id).toBe('openrouter')
     expect(PROVIDER_PRESETS.at(-1)?.id).toBe('custom')
   })
 
@@ -69,6 +71,8 @@ describe('provider presets API', () => {
     const minimax = PROVIDER_PRESETS.find((preset) => preset.id === 'minimax')
     const jiekouai = PROVIDER_PRESETS.find((preset) => preset.id === 'jiekouai')
     const shengsuanyun = PROVIDER_PRESETS.find((preset) => preset.id === 'shengsuanyun')
+    const openai = PROVIDER_PRESETS.find((preset) => preset.id === 'openai')
+    const openrouter = PROVIDER_PRESETS.find((preset) => preset.id === 'openrouter')
 
     expect(lmstudio?.baseUrl).toBe('http://localhost:1234')
     expect(lmstudio?.apiFormat).toBe('anthropic')
@@ -107,6 +111,18 @@ describe('provider presets API', () => {
     expect(shengsuanyun?.defaultModels.main).toBe('anthropic/claude-sonnet-4.6')
     expect(shengsuanyun?.defaultModels.haiku).toBe('anthropic/claude-haiku-4.5:thinking')
     expect(shengsuanyun?.modelContextWindows?.['anthropic/claude-sonnet-4.6']).toBe(1000000)
+    expect(openai?.baseUrl).toBe('https://api.openai.com')
+    expect(openai?.apiFormat).toBe('openai_responses')
+    expect(openai?.authStrategy).toBe('auth_token')
+    expect(openai?.defaultModels.main).toBe('gpt-5.2')
+    expect(openai?.defaultModels.haiku).toBe('gpt-5-mini')
+    expect(openai?.defaultModels.sonnet).toBe('gpt-5.2')
+    expect(openai?.defaultModels.opus).toBe('gpt-5.2')
+    expect(openrouter?.baseUrl).toBe('https://openrouter.ai/api')
+    expect(openrouter?.apiFormat).toBe('openai_chat')
+    expect(openrouter?.authStrategy).toBe('auth_token')
+    expect(openrouter?.defaultModels.main).toBe('openai/gpt-4o')
+    expect(openrouter?.defaultModels.haiku).toBe('openai/gpt-4o-mini')
   })
 
   test('configured presets can expose optional API key and promo metadata', () => {
@@ -118,6 +134,8 @@ describe('provider presets API', () => {
     const minimax = PROVIDER_PRESETS.find((preset) => preset.id === 'minimax')
     const jiekouai = PROVIDER_PRESETS.find((preset) => preset.id === 'jiekouai')
     const shengsuanyun = PROVIDER_PRESETS.find((preset) => preset.id === 'shengsuanyun')
+    const openai = PROVIDER_PRESETS.find((preset) => preset.id === 'openai')
+    const openrouter = PROVIDER_PRESETS.find((preset) => preset.id === 'openrouter')
     const custom = PROVIDER_PRESETS.find((preset) => preset.id === 'custom')
 
     expect(lmstudio?.needsApiKey).toBe(false)
@@ -155,6 +173,18 @@ describe('provider presets API', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: 'none',
     })
     expect(shengsuanyun?.modelContextWindows?.['anthropic/claude-opus-4.7']).toBe(1000000)
+    expect(openai?.apiKeyUrl).toBe('https://platform.openai.com/api-keys')
+    expect(openai?.promoText).toContain('OpenAI Responses')
+    expect(openai?.defaultEnv).toEqual({
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    })
+    expect(openrouter?.apiKeyUrl).toBe('https://openrouter.ai/settings/keys')
+    expect(openrouter?.promoText).toContain('OpenAI Chat Completions')
+    expect(openrouter?.defaultEnv).toEqual({
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    })
     expect(custom?.promoText).toBeUndefined()
     expect(custom?.authStrategy).toBe('auth_token')
     expect(custom?.defaultEnv).toBeUndefined()

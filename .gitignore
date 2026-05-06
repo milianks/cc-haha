@@ -8,6 +8,7 @@ openspec
 # Computer Use runtime (auto-generated)
 .runtime/
 extracted-natives/
+output
 
 # Adapter attachment cache (created at runtime by AttachmentStore when
 # running adapter tests or the feishu/telegram adapters locally)

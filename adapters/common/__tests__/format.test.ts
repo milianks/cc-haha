@@ -106,6 +106,7 @@ describe('formatImHelp', () => {
     const text = formatImHelp()
     expect(text).toContain('/new')
     expect(text).toContain('/projects')
+    expect(text).toContain('/llm')
     expect(text).toContain('/status')
     expect(text).toContain('/clear')
     expect(text).toContain('/stop')

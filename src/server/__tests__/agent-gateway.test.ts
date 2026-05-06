@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { handleApiRequest } from '../router.js'
-import { handleWebSocket, sendToSession } from '../ws/handler.js'
+import { __testCacheSlashCommands, handleWebSocket, sendToSession } from '../ws/handler.js'
 
 let tmpDir: string
 let originalConfigDir: string | undefined
@@ -188,5 +188,21 @@ describe('Agent Runtime Gateway', () => {
     expect(second.sent).toContainEqual(
       expect.objectContaining({ type: 'status', state: 'streaming' }),
     )
+  })
+})
+
+describe('WebSocket slash command replay', () => {
+  it('replays cached slash commands to clients that connect after CLI init broadcast', () => {
+    const sessionId = `late-slash-${crypto.randomUUID()}`
+    __testCacheSlashCommands(sessionId, [{ name: 'help', description: 'Show help' }])
+    const client = makeWs(sessionId)
+
+    handleWebSocket.open(client.ws)
+
+    expect(client.sent).toContainEqual({
+      type: 'system_notification',
+      subtype: 'slash_commands',
+      data: [{ name: 'help', description: 'Show help' }],
+    })
   })
 })

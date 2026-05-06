@@ -108,6 +108,15 @@ export class WsBridge {
     return this.send(chatId, { type: 'stop_generation' })
   }
 
+  /** Switch the provider/model for the session bound to chatId. */
+  sendRuntimeConfig(chatId: string, providerId: string | null, modelId: string): boolean {
+    return this.send(chatId, {
+      type: 'set_runtime_config',
+      providerId,
+      modelId,
+    })
+  }
+
   /** Register (or replace) the handler for server messages on a specific chatId. */
   onServerMessage(chatId: string, handler: MessageHandler): void {
     this.handlers.set(chatId, handler)

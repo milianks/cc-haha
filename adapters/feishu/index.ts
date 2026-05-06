@@ -35,6 +35,7 @@ import { extractInboundPayload } from './extract-payload.js'
 import { FeishuMediaService } from './media.js'
 import { AttachmentStore } from '../common/attachment/attachment-store.js'
 import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
+import { buildFeishuSlashCommandMenu } from '../common/slash-commands.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
 
@@ -83,6 +84,7 @@ const uploadedImageKeys = new Map<string, Map<string, string>>()
 let botOpenId: string | null = null
 // WSClient reference for graceful shutdown
 let wsClient: InstanceType<typeof Lark.WSClient> | null = null
+const registeredSlashCommandChats = new Map<string, string>()
 
 type ChatRuntimeState = {
   state: 'idle' | 'thinking' | 'streaming' | 'tool_executing' | 'permission_pending'
@@ -198,6 +200,40 @@ async function abortStreamingCard(chatId: string, err: Error): Promise<void> {
   if (!card) return
   streamingCards.delete(chatId)
   await card.abort(err).catch(() => {})
+}
+
+async function registerFeishuSlashCommands(chatId: string, data: unknown): Promise<void> {
+  const menu = buildFeishuSlashCommandMenu(data)
+  if (!menu) return
+  const signature = JSON.stringify(menu)
+  if (registeredSlashCommandChats.get(chatId) === signature) return
+  registeredSlashCommandChats.set(chatId, signature)
+
+  try {
+    await larkClient.im.chatMenuTree.create({
+      path: { chat_id: chatId },
+      data: menu as any,
+    })
+    console.log(`[Feishu] Registered slash command menu for chat ${chatId}`)
+  } catch (err) {
+    registeredSlashCommandChats.delete(chatId)
+    console.warn(
+      `[Feishu] Failed to register slash command menu for chat ${chatId}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+async function syncFeishuSlashCommands(chatId: string, sessionId: string): Promise<void> {
+  try {
+    const commands = await httpClient.getSessionSlashCommands(sessionId)
+    await registerFeishuSlashCommands(chatId, commands)
+  } catch (err) {
+    console.warn(
+      `[Feishu] Failed to sync slash commands for ${sessionId}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
 }
 
 function clearTransientChatState(chatId: string): void {
@@ -696,6 +732,7 @@ async function createSessionForChat(chatId: string, workDir: string): Promise<bo
       await sendText(chatId, '⚠️ 连接服务器超时，请重试。')
       return false
     }
+    await syncFeishuSlashCommands(chatId, sessionId)
     return true
   } catch (err) {
     await sendText(chatId, `❌ 无法创建会话: ${err instanceof Error ? err.message : String(err)}`)
@@ -933,6 +970,8 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         if (typeof model === 'string' && model.trim()) {
           runtime.model = model
         }
+      } else if (msg.subtype === 'slash_commands') {
+        await registerFeishuSlashCommands(chatId, msg.data)
       }
       break
   }
@@ -1327,9 +1366,11 @@ start().catch((err) => {
   process.exit(1)
 })
 
-process.on('SIGINT', () => {
+function shutdown() {
   console.log('[Feishu] Shutting down...')
   bridge.destroy()
   dedup.destroy()
   process.exit(0)
-})
+}
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)

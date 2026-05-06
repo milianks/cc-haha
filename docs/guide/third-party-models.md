@@ -1,19 +1,134 @@
-# 使用第三方模型（OpenAI / DeepSeek / 本地模型）
+# 使用第三方模型（OpenAI / DeepSeek / OpenRouter / 本地模型）
 
-本项目基于 Anthropic 协议与 LLM 通信。通过协议转换代理，可以使用 OpenAI、DeepSeek、Ollama 等任意模型。
+本项目的 CLI 侧仍使用 Anthropic Messages 协议。Provider 可以分三类接入：
+
+- Anthropic Messages 兼容端点：直连，例如 MiniMax、Kimi、DeepSeek、智谱 GLM。
+- OpenAI Chat Completions / Responses 端点：走 yuanclaw 内置协议转换代理，不需要 LiteLLM。
+- 其他不兼容服务：再用 LiteLLM 或其他外部代理兜底。
 
 ## 原理
 
 ```
-yuanclaw ──Anthropic协议──▶ LiteLLM Proxy ──OpenAI协议──▶ 目标模型 API
-                                      (协议转换)
+yuanclaw CLI ──Anthropic Messages──▶ yuanclaw provider/proxy ──目标协议──▶ 目标模型 API
 ```
 
-本项目发出 Anthropic Messages API 请求，LiteLLM 代理将其自动转换为 OpenAI Chat Completions API 格式并转发给目标模型。
+yuanclaw 内置 provider 支持 `anthropic`、`openai_chat` 和 `openai_responses` 三种 API 格式。激活 `openai_*` provider 后，CLI 会连接本地 `/proxy/v1/messages`，由 server 把 Anthropic 请求转换到 OpenAI 协议，再把响应转换回来。
 
 ---
 
-## 方式一：LiteLLM 代理（推荐）
+## 方式一：使用内置 provider（推荐）
+
+内置 provider 会写入 `~/.claude/yuanclaw/settings.json`，不会污染原版 `~/.claude/settings.json`。通过界面或 API 添加 provider 时选择对应 preset 即可。
+
+### OpenAI Responses
+
+Provider preset：
+
+```json
+{
+  "presetId": "openai",
+  "baseUrl": "https://api.openai.com",
+  "apiFormat": "openai_responses",
+  "authStrategy": "auth_token",
+  "models": {
+    "main": "gpt-5.2",
+    "haiku": "gpt-5-mini",
+    "sonnet": "gpt-5.2",
+    "opus": "gpt-5.2"
+  }
+}
+```
+
+激活后实际写入类似：
+
+```env
+ANTHROPIC_BASE_URL=http://127.0.0.1:3456/proxy
+ANTHROPIC_API_KEY=proxy-managed
+ANTHROPIC_MODEL=gpt-5.2
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5-mini
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.2
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.2
+API_TIMEOUT_MS=3000000
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+```
+
+真正的 OpenAI key 保存在 yuanclaw provider 记录里，由 server 访问上游 `/v1/responses`。
+
+### OpenRouter / OpenAI Chat Completions
+
+```json
+{
+  "presetId": "openrouter",
+  "baseUrl": "https://openrouter.ai/api",
+  "apiFormat": "openai_chat",
+  "authStrategy": "auth_token",
+  "models": {
+    "main": "openai/gpt-4o",
+    "haiku": "openai/gpt-4o-mini",
+    "sonnet": "openai/gpt-4o",
+    "opus": "openai/gpt-4o"
+  }
+}
+```
+
+`openai_chat` 会转发到 `${baseUrl}/v1/chat/completions`。OpenRouter 的 model 使用 `provider/model` 格式。
+
+### 自定义 OpenAI 兼容 provider
+
+如果服务支持 OpenAI 协议但没有内置 preset，新增 Custom provider：
+
+- `apiFormat=openai_chat`：目标服务支持 `/v1/chat/completions`。
+- `apiFormat=openai_responses`：目标服务支持 `/v1/responses`。
+- `baseUrl` 填到 API 根地址，不要追加 `/v1/chat/completions` 或 `/v1/responses`。
+
+---
+
+## 方式二：直连兼容 Anthropic 协议的第三方服务
+
+部分第三方服务直接兼容 Anthropic Messages API，无需协议转换：
+
+### MiniMax
+
+```env
+ANTHROPIC_AUTH_TOKEN=your_minimax_api_key_here
+# 海外用户使用 api.minimax.io，国内用户可改为 api.minimaxi.com
+ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
+ANTHROPIC_MODEL=MiniMax-M2.7
+ANTHROPIC_DEFAULT_SONNET_MODEL=MiniMax-M2.7
+ANTHROPIC_DEFAULT_HAIKU_MODEL=MiniMax-M2.7-highspeed
+ANTHROPIC_DEFAULT_OPUS_MODEL=MiniMax-M2.7
+API_TIMEOUT_MS=3000000
+DISABLE_TELEMETRY=1
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+```
+
+### Kimi for Coding
+
+```env
+ANTHROPIC_AUTH_TOKEN=your_kimi_key
+ANTHROPIC_BASE_URL=https://api.kimi.com/coding
+ANTHROPIC_MODEL=kimi-k2.6
+ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-k2.6
+ANTHROPIC_DEFAULT_HAIKU_MODEL=kimi-k2.6
+ANTHROPIC_DEFAULT_OPUS_MODEL=kimi-k2.6
+YUANCLAW_SEND_DISABLED_THINKING=1
+```
+
+### DeepSeek Anthropic 兼容端点
+
+```env
+ANTHROPIC_AUTH_TOKEN=your_deepseek_key
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+ANTHROPIC_MODEL=deepseek-v4-pro
+ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro
+ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
+ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro
+YUANCLAW_SEND_DISABLED_THINKING=1
+```
+
+---
+
+## 方式三：LiteLLM 代理（兜底）
 
 [LiteLLM](https://github.com/BerriAI/litellm) 是一个支持 100+ LLM 的统一代理网关（41k+ GitHub Stars），原生支持接收 Anthropic 协议请求。
 
@@ -153,50 +268,7 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 ---
 
-## 方式二：直连兼容 Anthropic 协议的第三方服务
-
-部分第三方服务直接兼容 Anthropic Messages API，无需额外代理：
-
-### OpenRouter
-
-```env
-ANTHROPIC_AUTH_TOKEN=sk-or-v1-xxx
-ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
-ANTHROPIC_MODEL=openai/gpt-4o
-ANTHROPIC_DEFAULT_SONNET_MODEL=openai/gpt-4o
-ANTHROPIC_DEFAULT_HAIKU_MODEL=openai/gpt-4o-mini
-ANTHROPIC_DEFAULT_OPUS_MODEL=openai/gpt-4o
-DISABLE_TELEMETRY=1
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-```
-
-### MiniMax（已在 .env.example 中配置）
-
-MiniMax 提供 Anthropic 兼容接口，支持直接接入，无需代理。可用模型：
-
-| 模型 | 说明 |
-|------|------|
-| `MiniMax-M2.7` | 默认推荐，综合性能优秀 |
-| `MiniMax-M2.7-highspeed` | 响应更快，适合对速度有要求的场景 |
-
-```env
-ANTHROPIC_AUTH_TOKEN=your_minimax_api_key_here
-# 海外用户使用 api.minimax.io，国内用户可改为 api.minimaxi.com
-ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
-ANTHROPIC_MODEL=MiniMax-M2.7
-ANTHROPIC_DEFAULT_SONNET_MODEL=MiniMax-M2.7
-ANTHROPIC_DEFAULT_HAIKU_MODEL=MiniMax-M2.7-highspeed
-ANTHROPIC_DEFAULT_OPUS_MODEL=MiniMax-M2.7
-API_TIMEOUT_MS=3000000
-DISABLE_TELEMETRY=1
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-```
-
-> **获取 API Key**：访问 [MiniMax 开放平台](https://platform.minimax.io) 注册并获取 API Key。
-
----
-
-## 方式三：其他代理工具
+## 方式四：其他代理工具
 
 社区还有一些专门为 Claude Code 做的代理工具：
 
@@ -211,23 +283,27 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 ## 注意事项与已知限制
 
-### 1. `drop_params: true` 很重要
+### 1. 内置 OpenAI proxy 不需要 LiteLLM
 
-本项目会发送 Anthropic 专有参数（如 `thinking`、`cache_control`），这些参数在 OpenAI API 中不存在。LiteLLM 配置中必须设置 `drop_params: true`，否则请求会报错。
+如果目标服务支持 OpenAI Chat Completions 或 Responses API，优先使用 `openai_chat` / `openai_responses` provider。LiteLLM 只作为目标服务不兼容内置 proxy 时的兜底。
 
-### 2. Extended Thinking 不可用
+### 2. `drop_params: true` 只对 LiteLLM 重要
+
+本项目会发送 Anthropic 专有参数（如 `thinking`、`cache_control`）。使用 LiteLLM 时必须设置 `drop_params: true`，否则请求可能报错。使用 yuanclaw 内置 provider 时不需要配置 LiteLLM。
+
+### 3. Extended Thinking 不可用
 
 Anthropic 的 Extended Thinking 功能是专有特性，其他模型不支持。使用第三方模型时此功能自动失效。
 
-### 3. Prompt Caching 不可用
+### 4. Prompt Caching 取决于上游
 
-`cache_control` 是 Anthropic 专有功能。使用第三方模型时，prompt caching 不会生效（但不会导致报错，会被 `drop_params` 忽略）。
+`cache_control` 是 Anthropic 专有功能。使用 OpenAI 兼容 provider 时，prompt caching 通常不会生效。
 
-### 4. 工具调用兼容性
+### 5. 工具调用兼容性
 
-本项目大量使用工具调用（tool_use），LiteLLM 会自动转换 Anthropic tool_use 格式到 OpenAI function_calling 格式。大部分情况下可以正常工作，但某些复杂工具调用可能存在兼容性问题。如遇问题，建议使用能力较强的模型（如 GPT-4o）。
+本项目大量使用工具调用。yuanclaw 内置 proxy 会转换 Anthropic `tool_use` 与 OpenAI function calling；大部分情况下可以正常工作，但弱模型或非标准兼容服务可能存在工具调用缺失、参数 JSON 不完整等问题。
 
-### 5. 遥测和非必要网络请求
+### 6. 遥测和非必要网络请求
 
 建议配置以下环境变量以避免不必要的网络请求：
 ```

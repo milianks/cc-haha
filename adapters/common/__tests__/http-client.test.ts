@@ -125,6 +125,30 @@ describe('AdapterHttpClient', () => {
     )
   })
 
+
+
+  it('getSessionSlashCommands calls GET /api/sessions/:id/slash-commands', async () => {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({
+        commands: [
+          { name: 'help', description: 'Show help' },
+          { name: 'new', description: 'New session' },
+        ],
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    ) as any
+
+    const commands = await client.getSessionSlashCommands('session-123')
+    expect(commands).toEqual([
+      { name: 'help', description: 'Show help' },
+      { name: 'new', description: 'New session' },
+    ])
+    expect((globalThis.fetch as any).mock.calls[0][0]).toBe(
+      'http://127.0.0.1:3456/api/sessions/session-123/slash-commands',
+    )
+  })
+
   it('getTasksForSession calls GET /api/tasks/lists/:id', async () => {
     globalThis.fetch = mock(() =>
       Promise.resolve(new Response(JSON.stringify({
@@ -143,5 +167,84 @@ describe('AdapterHttpClient', () => {
     expect((globalThis.fetch as any).mock.calls[0][0]).toBe(
       'http://127.0.0.1:3456/api/tasks/lists/session-123',
     )
+  })
+
+  it('listRuntimeModelOptions includes provider-backed models', async () => {
+    globalThis.fetch = mock((url: string) => {
+      if (url.endsWith('/api/providers')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          activeId: 'provider-openai',
+          providers: [
+            {
+              id: 'provider-openai',
+              name: 'OpenAI Responses',
+              models: {
+                main: 'gpt-5.5',
+                haiku: '',
+                sonnet: 'gpt-5.5-mini',
+                opus: 'gpt-5.5',
+              },
+            },
+          ],
+        }), {
+          headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          provider: { id: 'provider-openai', name: 'OpenAI Responses' },
+          models: [{ id: 'gpt-5.5', name: 'gpt-5.5', description: 'Main model', context: '' }],
+        }), {
+          headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }) as any
+
+    const options = await client.listRuntimeModelOptions()
+
+    expect(options).toHaveLength(2)
+    expect(options[0]).toMatchObject({
+      providerId: 'provider-openai',
+      providerName: 'OpenAI Responses',
+      modelId: 'gpt-5.5',
+      activeProvider: true,
+    })
+    expect(options[1]?.modelId).toBe('gpt-5.5-mini')
+  })
+
+  it('listRuntimeModelOptions falls back to official model list when no providers exist', async () => {
+    globalThis.fetch = mock((url: string) => {
+      if (url.endsWith('/api/providers')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          activeId: null,
+          providers: [],
+        }), {
+          headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      if (url.endsWith('/api/models')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          provider: null,
+          models: [
+            { id: 'claude-opus-4-7', name: 'Opus 4.7', description: 'Most capable', context: '1m' },
+          ],
+        }), {
+          headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      throw new Error(`unexpected URL: ${url}`)
+    }) as any
+
+    const options = await client.listRuntimeModelOptions()
+
+    expect(options).toHaveLength(1)
+    expect(options[0]).toMatchObject({
+      providerId: null,
+      providerName: 'Official / Default',
+      modelId: 'claude-opus-4-7',
+      modelName: 'Opus 4.7',
+      activeProvider: true,
+    })
   })
 })

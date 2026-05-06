@@ -18,7 +18,7 @@ import { sessionService } from '../services/sessionService.js'
 import { conversationService } from '../services/conversationService.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import { getSlashCommands } from '../ws/handler.js'
-import { getCommandName } from '../../commands.js'
+import { getAgentSlashCommands, getCommandName } from '../../commands.js'
 import { getSkillDirCommands } from '../../skills/loadSkillsDir.js'
 import { WorkspaceService } from '../services/workspaceService.js'
 import {
@@ -336,8 +336,11 @@ async function getSessionSlashCommands(sessionId: string): Promise<Response> {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
 
-  const commands = await getSkillDirCommands(workDir)
-  const slashCommands = commands
+  const [commands, agentCommands] = await Promise.all([
+    getSkillDirCommands(workDir),
+    getAgentSlashCommands(workDir),
+  ])
+  const slashCommands = [...commands, ...agentCommands]
     .filter((command) => command.userInvocable !== false)
     .map((command) => ({
       name: getCommandName(command),

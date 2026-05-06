@@ -199,6 +199,7 @@ const usageReport: Command = {
 }
 import oauthRefresh from './commands/oauth-refresh/index.js'
 import debugToolCall from './commands/debug-tool-call/index.js'
+import { getAgentDefinitionsWithOverrides } from './tools/AgentTool/loadAgentsDir.js'
 import { getSettingSourceName } from './utils/settings/constants.js'
 import {
   type Command,
@@ -445,10 +446,12 @@ export function meetsAvailabilityRequirement(cmd: Command): boolean {
 const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
   const [
     { skillDirCommands, pluginSkills, bundledSkills, builtinPluginSkills },
+    agentSlashCommands,
     pluginCommands,
     workflowCommands,
   ] = await Promise.all([
     getSkills(cwd),
+    getAgentSlashCommands(cwd),
     getPluginCommands(),
     getWorkflowCommands ? getWorkflowCommands(cwd) : Promise.resolve([]),
   ])
@@ -460,6 +463,7 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
     ...workflowCommands,
     ...pluginCommands,
     ...pluginSkills,
+    ...agentSlashCommands,
     ...COMMANDS(),
   ]
 })
@@ -518,6 +522,7 @@ export async function getCommands(cwd: string): Promise<Command[]> {
  */
 export function clearCommandMemoizationCaches(): void {
   loadAllCommands.cache?.clear?.()
+  getAgentSlashCommands.cache?.clear?.()
   getSkillToolCommands.cache?.clear?.()
   getSlashCommandToolSkills.cache?.clear?.()
   // getSkillIndex in skillSearch/localSearch.ts is a separate memoization layer
@@ -603,6 +608,56 @@ export const getSlashCommandToolSkills = memoize(
   },
 )
 
+const AGENT_SLASH_COMMAND_PREFIX = 'agent:'
+
+function isAgentSlashCommandName(name: string): boolean {
+  return name.startsWith(AGENT_SLASH_COMMAND_PREFIX)
+}
+
+function isSlashInvocableAgentType(agentType: string): boolean {
+  return agentType.trim().length > 0 && !/\s/.test(agentType)
+}
+
+function createAgentSlashCommand(agentType: string, whenToUse: string): Command {
+  const trimmedAgentType = agentType.trim()
+  const commandName = `${AGENT_SLASH_COMMAND_PREFIX}${trimmedAgentType}`
+
+  return {
+    type: 'prompt',
+    name: commandName,
+    description: whenToUse,
+    progressMessage: `running ${trimmedAgentType}`,
+    contentLength: 0,
+    argumentHint: '<task>',
+    source: 'builtin',
+    disableModelInvocation: true,
+    userInvocable: true,
+    context: 'fork',
+    agent: trimmedAgentType,
+    async getPromptForCommand(args) {
+      const trimmedArgs = args.trim()
+      return [
+        {
+          type: 'text',
+          text:
+            trimmedArgs.length > 0
+              ? trimmedArgs
+              : `Introduce yourself as the ${trimmedAgentType} agent and ask what task to handle.`,
+        },
+      ]
+    },
+  }
+}
+
+export const getAgentSlashCommands = memoize(
+  async (cwd: string): Promise<Command[]> => {
+    const { activeAgents } = await getAgentDefinitionsWithOverrides(cwd)
+    return activeAgents
+      .filter(agent => isSlashInvocableAgentType(agent.agentType))
+      .map(agent => createAgentSlashCommand(agent.agentType, agent.whenToUse))
+  },
+)
+
 /**
  * Commands that are safe to use in remote mode (--remote).
  * These only affect local TUI state and don't depend on local filesystem,
@@ -631,6 +686,10 @@ export const REMOTE_SAFE_COMMANDS: Set<Command> = new Set([
   stickers, // Stickers
   mobile, // Mobile QR code
 ])
+
+export function isRemoteSafeCommand(cmd: Command): boolean {
+  return REMOTE_SAFE_COMMANDS.has(cmd) || isAgentSlashCommandName(cmd.name)
+}
 
 /**
  * Builtin commands of type 'local' that ARE safe to execute when received
@@ -678,7 +737,7 @@ export function isBridgeSafeCommand(cmd: Command): boolean {
  * the CCR init message arrives.
  */
 export function filterCommandsForRemoteMode(commands: Command[]): Command[] {
-  return commands.filter(cmd => REMOTE_SAFE_COMMANDS.has(cmd))
+  return commands.filter(isRemoteSafeCommand)
 }
 
 export function findCommand(

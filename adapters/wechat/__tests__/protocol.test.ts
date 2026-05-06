@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { buildClientVersion, extractWechatText, sendWechatText, sendWechatTyping } from '../protocol.js'
+import { buildClientVersion, createWechatMenu, extractWechatText, sendWechatText, sendWechatTyping } from '../protocol.js'
 import { collectWechatMediaCandidates } from '../media.js'
 
 const originalFetch = globalThis.fetch
@@ -107,6 +107,28 @@ describe('WeChat protocol helpers', () => {
 
     expect(requests).toHaveLength(1)
     expect(JSON.parse(requests[0]!).msg.context_token).toBe('ctx')
+  })
+
+
+
+  it('creates a custom menu through the official account access_token query API', async () => {
+    const urls: string[] = []
+    const bodies: string[] = []
+    const menuAccessToken = ['wechat', 'menu', 'test', 'value'].join('-')
+    globalThis.fetch = (async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      urls.push(String(url))
+      bodies.push(String(init?.body ?? ''))
+      return new Response(JSON.stringify({ errcode: 0, errmsg: 'ok' }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    await createWechatMenu({
+      baseUrl: 'https://api.weixin.qq.com',
+      token: menuAccessToken,
+      menu: { button: [{ name: 'Yuanclaw', sub_button: [] }] },
+    })
+
+    expect(urls[0]).toBe(`https://api.weixin.qq.com/cgi-bin/menu/create?access_token=${menuAccessToken}`)
+    expect(JSON.parse(bodies[0]!)).toEqual({ button: [{ name: 'Yuanclaw', sub_button: [] }] })
   })
 
   it('throws when sendtyping returns a non-zero WeChat ret code', async () => {

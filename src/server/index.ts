@@ -261,13 +261,13 @@ function cleanupAllSessions() {
 process.on('SIGTERM', () => {
   console.log('[Server] Received SIGTERM')
   cleanupAllSessions()
-  process.exit(0)
+  if (!process.env.GATEWAY_MODE) process.exit(0)
 })
 
 process.on('SIGINT', () => {
   console.log('[Server] Received SIGINT')
   cleanupAllSessions()
-  process.exit(0)
+  if (!process.env.GATEWAY_MODE) process.exit(0)
 })
 
 process.on('exit', () => {

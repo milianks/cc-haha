@@ -28,6 +28,7 @@ type ImStatusSummary = {
 const IM_HELP_LINES = [
   '/new [项目] / 新会话 — 新建会话或切换项目',
   '/projects / 项目列表 — 查看最近项目',
+  '/llm [编号或模型] / 模型 — 查看或切换当前会话模型',
   '/status / 状态 — 查看当前会话状态',
   '/clear / 清空 — 清空当前会话上下文',
   '/stop / 停止 — 停止当前生成',

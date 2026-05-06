@@ -18,10 +18,12 @@ import {
 import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient } from '../common/http-client.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
+import { buildWechatMenu } from '../common/slash-commands.js'
 import { AttachmentStore } from '../common/attachment/attachment-store.js'
 import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
 import { WechatTypingController } from './typing.js'
 import {
+  createWechatMenu,
   extractWechatText,
   getWechatConfig,
   getWechatUpdates,
@@ -61,6 +63,7 @@ const typingController = new WechatTypingController(sendTypingIndicator)
 
 let getUpdatesBuf = ''
 let stopped = false
+let registeredSlashCommandsSignature = ''
 
 attachmentStore.gc().catch((err) => {
   console.warn('[WeChat] AttachmentStore.gc failed:', err instanceof Error ? err.message : err)
@@ -172,6 +175,37 @@ async function getTypingTicket(chatId: string, status: 'typing' | 'cancel'): Pro
     if (typingTicket) typingTickets.set(chatId, typingTicket)
   }
   return typingTicket || null
+}
+
+async function registerWechatSlashCommands(data: unknown): Promise<void> {
+  const menu = buildWechatMenu(data)
+  if (!menu) return
+  const signature = JSON.stringify(menu)
+  if (signature === registeredSlashCommandsSignature) return
+  registeredSlashCommandsSignature = signature
+
+  try {
+    await createWechatMenu({ baseUrl, token: botToken, menu })
+    console.log('[WeChat] Registered slash command menu')
+  } catch (err) {
+    registeredSlashCommandsSignature = ''
+    console.warn(
+      '[WeChat] Failed to register slash command menu:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+async function syncWechatSlashCommands(sessionId: string): Promise<void> {
+  try {
+    const commands = await httpClient.getSessionSlashCommands(sessionId)
+    await registerWechatSlashCommands(commands)
+  } catch (err) {
+    console.warn(
+      `[WeChat] Failed to sync slash commands for ${sessionId}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
 }
 
 function clearTransientChatState(chatId: string): void {
@@ -297,6 +331,7 @@ async function createSessionForChat(chatId: string, workDir: string): Promise<bo
       await sendText(chatId, '连接服务器超时，请重试。')
       return false
     }
+    await syncWechatSlashCommands(sessionId)
     return true
   } catch (err) {
     await sendText(chatId, `无法创建会话: ${err instanceof Error ? err.message : String(err)}`)
@@ -432,6 +467,8 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
       if (msg.subtype === 'init' && msg.data && typeof msg.data === 'object') {
         const model = (msg.data as Record<string, unknown>).model
         if (typeof model === 'string' && model.trim()) runtime.model = model
+      } else if (msg.subtype === 'slash_commands') {
+        await registerWechatSlashCommands(msg.data)
       }
       break
   }
@@ -622,11 +659,13 @@ console.log('[WeChat] Starting adapter...')
 console.log(`[WeChat] Account: ${accountId}`)
 void pollLoop()
 
-process.on('SIGINT', () => {
+function shutdown() {
   console.log('[WeChat] Shutting down...')
   stopped = true
   typingController.destroy()
   bridge.destroy()
   dedup.destroy()
   process.exit(0)
-})
+}
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)

@@ -3853,6 +3853,26 @@ async function run(): Promise<CommanderCommand> {
   // Worktree flags
   program.option('-w, --worktree [name]', 'Create a new git worktree for this session (optionally specify a name)');
   program.option('--tmux', 'Create a tmux session for the worktree (requires --worktree). Uses iTerm2 native panes when available; use --tmux=classic for traditional tmux.');
+  const addGatewayOptions = <T extends CommanderCommand>(command: T): T => command
+    .option('--port <number>', 'HTTP/WebSocket port', '3456')
+    .option('--host <string>', 'Bind address', '127.0.0.1')
+    .option('--force', 'Stop any existing local gateway on the target port before starting')
+    .option('--auth-required', 'Require Bearer auth for REST and WebSocket clients')
+    .option('--cli-path <path>', 'yuanclaw CLI path used for spawned chat sessions')
+  const runGateway = async (options: {
+    port?: string;
+    host?: string;
+    force?: boolean;
+    authRequired?: boolean;
+    cliPath?: string;
+  }) => {
+    const {
+      gatewayRunHandler
+    } = await import('./cli/handlers/gateway.js');
+    await gatewayRunHandler(options);
+  };
+  const gateway = addGatewayOptions(program.command('gateway').description('Start the local yuanclaw gateway').action(runGateway));
+  addGatewayOptions(gateway.command('run').description('Start the local yuanclaw gateway in the foreground').action(runGateway));
   if (canUserConfigureAdvisor()) {
     program.addOption(new Option('--advisor <model>', 'Enable the server-side advisor tool with the specified model (alias or full ID).').hideHelp());
   }

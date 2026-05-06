@@ -26,6 +26,46 @@ export type SessionTask = {
   status: 'pending' | 'in_progress' | 'completed'
 }
 
+export type ApiModelInfo = {
+  id: string
+  name: string
+  description: string
+  context: string
+}
+
+export type ApiModelList = {
+  models: ApiModelInfo[]
+  provider: { id: string; name: string } | null
+}
+
+export type ProviderModelMapping = {
+  main: string
+  haiku: string
+  sonnet: string
+  opus: string
+}
+
+export type AdapterProvider = {
+  id: string
+  name: string
+  models: ProviderModelMapping
+}
+
+export type ProviderList = {
+  providers: AdapterProvider[]
+  activeId: string | null
+}
+
+export type RuntimeModelOption = {
+  providerId: string | null
+  providerName: string
+  modelId: string
+  modelName: string
+  description: string
+  context: string
+  activeProvider: boolean
+}
+
 export class AdapterHttpClient {
   readonly httpBaseUrl: string
   private readonly allowedProjectRoots: string[]
@@ -154,6 +194,29 @@ export class AdapterHttpClient {
     }
   }
 
+  async getSessionSlashCommands(sessionId: string): Promise<Array<{ name: string; description: string }>> {
+    const { controller, timer } = this.createTimeoutController()
+    try {
+      const res = await fetch(`${this.httpBaseUrl}/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`, {
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        if (res.status === 404) return []
+        const err = await res.json().catch(() => ({ message: res.statusText }))
+        throw new Error(`Failed to load slash commands: ${(err as any).message}`)
+      }
+      const data = (await res.json()) as { commands?: Array<{ name: string; description?: string }> }
+      return Array.isArray(data.commands)
+        ? data.commands.map((command) => ({
+            name: String(command.name ?? ''),
+            description: String(command.description ?? ''),
+          })).filter((command) => command.name.trim().length > 0)
+        : []
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   async getTasksForSession(sessionId: string): Promise<SessionTask[]> {
     const { controller, timer } = this.createTimeoutController()
     try {
@@ -171,6 +234,102 @@ export class AdapterHttpClient {
       clearTimeout(timer)
     }
   }
+
+  async listModels(): Promise<ApiModelList> {
+    const { controller, timer } = this.createTimeoutController()
+    try {
+      const res = await fetch(`${this.httpBaseUrl}/api/models`, {
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        throw new Error(`Failed to list models: ${res.statusText}`)
+      }
+      return (await res.json()) as ApiModelList
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async listProviders(): Promise<ProviderList> {
+    const { controller, timer } = this.createTimeoutController()
+    try {
+      const res = await fetch(`${this.httpBaseUrl}/api/providers`, {
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        throw new Error(`Failed to list providers: ${res.statusText}`)
+      }
+      return (await res.json()) as ProviderList
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async listRuntimeModelOptions(): Promise<RuntimeModelOption[]> {
+    const [providerList, activeModels] = await Promise.all([
+      this.listProviders(),
+      this.listModels(),
+    ])
+    const options: RuntimeModelOption[] = []
+    const seen = new Set<string>()
+
+    const addOption = (option: RuntimeModelOption) => {
+      const key = `${option.providerId ?? 'official'}:${option.modelId}`
+      if (seen.has(key) || !option.modelId.trim()) return
+      seen.add(key)
+      options.push(option)
+    }
+
+    for (const provider of providerList.providers) {
+      for (const model of buildProviderModelEntries(provider.models)) {
+        addOption({
+          providerId: provider.id,
+          providerName: provider.name,
+          modelId: model.id,
+          modelName: model.name,
+          description: model.description,
+          context: '',
+          activeProvider: providerList.activeId === provider.id,
+        })
+      }
+    }
+
+    if (providerList.providers.length === 0 || activeModels.provider === null) {
+      for (const model of activeModels.models) {
+        addOption({
+          providerId: null,
+          providerName: 'Official / Default',
+          modelId: model.id,
+          modelName: model.name || model.id,
+          description: model.description || 'Model',
+          context: model.context || '',
+          activeProvider: providerList.activeId === null,
+        })
+      }
+    }
+
+    return options
+  }
+}
+
+function buildProviderModelEntries(models: ProviderModelMapping): ApiModelInfo[] {
+  const entries: ApiModelInfo[] = []
+  addProviderModel(entries, models.main, 'Main model')
+  addProviderModel(entries, models.haiku, 'Haiku model')
+  addProviderModel(entries, models.sonnet, 'Sonnet model')
+  addProviderModel(entries, models.opus, 'Opus model')
+  return entries
+}
+
+function addProviderModel(entries: ApiModelInfo[], id: string, description: string): void {
+  const modelId = id.trim()
+  if (!modelId || entries.some((entry) => entry.id === modelId)) return
+  entries.push({
+    id: modelId,
+    name: modelId,
+    description,
+    context: '',
+  })
 }
 
 function isPathWithinAllowedRoots(target: string, roots: string[]): boolean {

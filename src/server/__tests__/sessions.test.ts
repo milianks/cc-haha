@@ -11,6 +11,7 @@ import { SessionService } from '../services/sessionService.js'
 import { sessionService } from '../services/sessionService.js'
 import { conversationService } from '../services/conversationService.js'
 import { clearCommandsCache } from '../../commands.js'
+import { clearAgentDefinitionsCache } from '../../tools/AgentTool/loadAgentsDir.js'
 import { sanitizePath } from '../../utils/sessionStoragePortable.js'
 
 // ============================================================================
@@ -74,6 +75,26 @@ async function writeSkill(
   await fs.writeFile(
     path.join(skillDir, 'SKILL.md'),
     ['---', `description: ${description}`, '---', '', `# ${skillName}`].join('\n'),
+    'utf-8',
+  )
+}
+
+async function writeAgent(
+  rootDir: string,
+  agentName: string,
+  description: string,
+): Promise<void> {
+  await fs.mkdir(rootDir, { recursive: true })
+  await fs.writeFile(
+    path.join(rootDir, `${agentName}.md`),
+    [
+      '---',
+      `name: ${agentName}`,
+      `description: ${description}`,
+      '---',
+      '',
+      `You are the ${agentName} agent.`,
+    ].join('\n'),
     'utf-8',
   )
 }
@@ -1236,6 +1257,42 @@ describe('Sessions API', () => {
     )
     expect(body.commands).toContainEqual(
       expect.objectContaining({ name: 'project-skill', description: 'Project skill description' }),
+    )
+  })
+
+  it('GET /api/sessions/:id/slash-commands should include active agent slash commands before CLI init', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff'
+    const workDir = path.join(tmpDir, 'workspace', 'agents-app')
+
+    await writeAgent(
+      path.join(workDir, '.claude', 'agents'),
+      'security-auditor',
+      'Review security-sensitive changes',
+    )
+
+    await writeSessionFile('-tmp-api-test', sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry(workDir),
+    ])
+
+    clearCommandsCache()
+    clearAgentDefinitionsCache()
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/slash-commands`)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      commands: Array<{ name: string; description: string }>
+    }
+
+    expect(body.commands).toContainEqual(
+      expect.objectContaining({ name: 'agent:general-purpose' }),
+    )
+    expect(body.commands).toContainEqual(
+      expect.objectContaining({
+        name: 'agent:security-auditor',
+        description: 'Review security-sensitive changes',
+      }),
     )
   })
 
